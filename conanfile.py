@@ -22,6 +22,7 @@ class ShineProxyConan(ConanFile):
 
     def requirements(self):
         self.requires("boost/1.85.0")
+        self.requires("zlib/1.3.1")
         self.requires("abseil/20240116.2")
         self.requires("yaml-cpp/0.8.0")
         self.requires("prometheus-cpp/1.2.4")

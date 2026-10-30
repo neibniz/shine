@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/auth.hpp"
 #include "core/buffer.hpp"
 #include "core/common.hpp"
 #include "proto/resp2_parser.hpp"
@@ -21,7 +22,8 @@ namespace shine {
 
 struct LinkOptions {
     std::string peer_label;            // for logs/metrics
-    std::string password;              // if non-empty, requires AUTH
+    std::string password;              // single legacy credential or client secret
+    std::vector<AuthUser> users;       // server credentials
     u32         init_window  = Session::kDefaultInitWindow;
     std::chrono::seconds ping_interval{15};
     std::chrono::seconds pong_timeout{10};
@@ -40,6 +42,8 @@ using NewSessionHandler =
 class Link final : public std::enable_shared_from_this<Link> {
 public:
     Link(tcp::socket sock, LinkOptions opts);
+    Link(std::shared_ptr<ISessionStream> stream, asio::any_io_executor executor,
+         LinkOptions opts);
     ~Link();
 
     // Start reader/writer coroutines. On server links, opens handler is set;
@@ -65,6 +69,7 @@ public:
 
     const LinkOptions& options() const noexcept { return opts_; }
     std::string        peer() const { return opts_.peer_label; }
+    std::optional<UserIdentity> authenticatedUser() const { return identity_; }
 
     asio::any_io_executor executor() noexcept { return strand_; }
 
@@ -82,9 +87,10 @@ private:
     SessionPtr findSession(u64 sid);
     void       eraseSession(u64 sid);
 
-    tcp::socket                  sock_;
     LinkOptions                  opts_;
     asio::strand<asio::any_io_executor> strand_;
+    std::shared_ptr<ISessionStream> stream_;
+    std::optional<UserIdentity> identity_;
 
     proto::Resp2Parser parser_;
     ReadBuffer         read_buf_;

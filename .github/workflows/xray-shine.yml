@@ -1,0 +1,224 @@
+name: Build Xray with Shine
+
+on:
+  workflow_dispatch:
+    inputs:
+      xray_ref:
+        description: 'Xray-core tag, branch, or commit (must be compatible with the Shine adapter)'
+        type: string
+        required: true
+        default: 'v26.10.29'
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.xray_ref || 'default' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+      short: ${{ steps.revision.outputs.short }}
+    steps:
+      - name: Resolve the selected Xray-core version
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ inputs.xray_ref || 'v26.10.29' }}
+          path: xray-core
+          persist-credentials: false
+      - name: Record the exact revision
+        id: revision
+        working-directory: xray-core
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Xray-core revision: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: shine
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: xray-core
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: shine/go/xray/go.mod
+          cache-dependency-path: |
+            shine/go/xray/go.sum
+            xray-core/go.sum
+      - name: Prepare and install Shine into the selected Xray checkout
+        run: |
+          shine/go/xray/scripts/prepare-adapter.sh xray-core "$RUNNER_TEMP/shine-adapter"
+          SHINE_XRAY_ADAPTER_DIR="$RUNNER_TEMP/shine-adapter" shine/go/xray/scripts/install-into-xray.sh xray-core
+      - name: Build native Xray for end-to-end tests
+        working-directory: xray-core
+        run: GOWORK=off CGO_ENABLED=0 go build -mod=mod -trimpath -buildvcs=false -o "$RUNNER_TEMP/xray" ./main
+      - name: Test against the selected Xray revision
+        env:
+          SHINE_XRAY_BIN: ${{ runner.temp }}/xray
+        run: |
+          go work init "$GITHUB_WORKSPACE/shine/go/shine" "$RUNNER_TEMP/shine-adapter" "$GITHUB_WORKSPACE/xray-core"
+          export GOWORK="$GITHUB_WORKSPACE/go.work"
+          (cd shine/go/shine && go test -race ./...)
+          (cd "$RUNNER_TEMP/shine-adapter" && go test -race ./...)
+
+  build:
+    needs: [resolve, verify]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64, os: linux, arch: amd64, arm: '', extension: tar.gz }
+          - { name: linux-arm64, os: linux, arch: arm64, arm: '', extension: tar.gz }
+          - { name: linux-armv7, os: linux, arch: arm, arm: '7', extension: tar.gz }
+          - { name: linux-386, os: linux, arch: '386', arm: '', extension: tar.gz }
+          - { name: darwin-amd64, os: darwin, arch: amd64, arm: '', extension: tar.gz }
+          - { name: darwin-arm64, os: darwin, arch: arm64, arm: '', extension: tar.gz }
+          - { name: windows-amd64, os: windows, arch: amd64, arm: '', extension: zip }
+          - { name: windows-arm64, os: windows, arch: arm64, arm: '', extension: zip }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: shine
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: xray-core
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: shine/go/xray/go.mod
+          cache-dependency-path: |
+            shine/go/xray/go.sum
+            xray-core/go.sum
+      - name: Prepare and merge Shine into Xray
+        run: |
+          shine/go/xray/scripts/prepare-adapter.sh xray-core "$RUNNER_TEMP/shine-adapter"
+          SHINE_XRAY_ADAPTER_DIR="$RUNNER_TEMP/shine-adapter" shine/go/xray/scripts/install-into-xray.sh xray-core
+      - name: Build and package ${{ matrix.name }}
+        env:
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_ARM: ${{ matrix.arm }}
+        run: shine/go/xray/scripts/build-distribution.sh xray-core "$TARGET_OS" "$TARGET_ARCH" "$GITHUB_WORKSPACE/dist" "$TARGET_ARM"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-shine-${{ matrix.name }}
+          path: dist/xray-shine-${{ matrix.name }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 14
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: xray-shine-*
+          merge-multiple: true
+      - name: Compute checksums
+        working-directory: dist
+        run: sha256sum xray-shine-*.tar.gz xray-shine-*.zip > SHA256SUMS-xray-shine.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-shine-SHA256SUMS
+          path: dist/SHA256SUMS-xray-shine.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  container:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: shine
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: xray-shine-linux-amd64
+          path: downloads/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: xray-shine-linux-arm64
+          path: downloads/arm64
+      - name: Prepare container context
+        run: |
+          mkdir -p context/linux-amd64 context/linux-arm64 context/licenses
+          tar -xzf downloads/amd64/xray-shine-linux-amd64.tar.gz -C downloads/amd64
+          tar -xzf downloads/arm64/xray-shine-linux-arm64.tar.gz -C downloads/arm64
+          cp downloads/amd64/xray-shine-linux-amd64/xray context/linux-amd64/xray
+          cp downloads/arm64/xray-shine-linux-arm64/xray context/linux-arm64/xray
+          cp downloads/amd64/xray-shine-linux-amd64/LICENSE-* context/licenses/
+          cp shine/go/xray/Dockerfile context/Dockerfile
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-xray
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=sha-${{ github.sha }}-xray-${{ needs.resolve.outputs.short }}
+      - name: Build and publish multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: context
+          file: context/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    needs: [build, checksums, container]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: xray-shine-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/xray-shine-*.tar.gz
+            dist/xray-shine-*.zip
+            dist/SHA256SUMS-xray-shine.txt
+          fail_on_unmatched_files: true

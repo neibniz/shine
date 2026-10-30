@@ -1,0 +1,18 @@
+# C++ Shine 服务端。将密码替换为独立的随机值。
+metrics:
+  listen: 127.0.0.1:9100
+inbounds:
+  - tag: shine-in
+    protocol: shine
+    listen: 0.0.0.0:7011
+    users:
+      - auth: "replace-with-first-secret"
+        email: "first@example.com"
+      - auth: "replace-with-second-secret"
+        email: "second@example.com"
+    compression: true
+outbounds:
+  - tag: direct
+    protocol: direct
+route:
+  default: direct

@@ -3,6 +3,7 @@
 #include "config/schema.hpp"
 #include "inbound/inbound.hpp"
 #include "transport/link.hpp"
+#include "redis/acceptor.hpp"
 
 #include <absl/synchronization/mutex.h>
 
@@ -24,10 +25,13 @@ public:
 
 private:
     awaitable<void> acceptLoop();
+    awaitable<void> acceptRedis(tcp::socket sock, LinkOptions options);
+    void startLink(LinkPtr link);
 
     asio::any_io_executor ex_;
     config::InboundConfig cfg_;
     tcp::acceptor         acceptor_;
+    std::shared_ptr<redis::Acceptor> redis_acceptor_;
     SessionRequestHandler on_req_;
     std::atomic<bool>     stopping_{false};
     std::vector<LinkPtr>  links_;

@@ -7,6 +7,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <limits>
 #include <fstream>
 #include <sstream>
 
@@ -68,6 +69,8 @@ StatusOr<std::size_t> parseSize(const std::string& s) {
     else if (unit == "M" || unit == "MB" || unit == "MiB") mult = 1024ULL * 1024;
     else if (unit == "G" || unit == "GB" || unit == "GiB") mult = 1024ULL * 1024 * 1024;
     else return absl::InvalidArgumentError("unknown size unit: " + unit);
+    if (static_cast<std::uint64_t>(val) > std::numeric_limits<std::size_t>::max() / mult)
+        return absl::InvalidArgumentError("size is too large");
     return static_cast<std::size_t>(val) * mult;
 }
 
@@ -79,6 +82,43 @@ StatusOr<std::size_t> parseSizeNode(const YAML::Node& n, const std::string& key,
 
 } // namespace
 
+namespace {
+Status validateShineAuth(const std::string& password, const std::vector<AuthUser>& users, bool outbound) {
+    if (!password.empty() && !users.empty()) return absl::InvalidArgumentError("shine: use either password or users");
+    if (outbound && users.size() > 1) return absl::InvalidArgumentError("shine: outbound requires exactly one user");
+    absl::flat_hash_set<std::string> secrets, emails;
+    for (const auto& u : users) {
+        if (u.auth.empty()) return absl::InvalidArgumentError("shine: user auth cannot be empty");
+        if (!secrets.insert(u.auth).second) return absl::InvalidArgumentError("shine: duplicate user auth");
+        if (!u.email.empty() && !emails.insert(u.email).second) return absl::InvalidArgumentError("shine: duplicate user email");
+    }
+    return absl::OkStatus();
+}
+Status validateShineTransport(const std::string& transport, bool compression, u32 window) {
+    if (transport != "redis" && transport != "tcp") return absl::InvalidArgumentError("shine: invalid transport");
+    if (transport == "tcp" && compression) return absl::InvalidArgumentError("shine: compression requires redis transport");
+    if (!window) return absl::InvalidArgumentError("shine: initial window must be positive");
+    return absl::OkStatus();
+}
+StatusOr<std::vector<AuthUser>> parseUsers(const YAML::Node& n) {
+    std::vector<AuthUser> result;
+    if (!n["users"].IsDefined()) return result;
+    if (!n["users"].IsSequence() || n["users"].size() == 0) return absl::InvalidArgumentError("shine: users must be a nonempty array");
+    for (const auto& item : n["users"]) {
+        if (!item.IsMap()) return absl::InvalidArgumentError("shine: user must be a map");
+        for (const auto& field : item) {
+            auto key = field.first.as<std::string>();
+            if (key != "auth" && key != "email" && key != "level") return absl::InvalidArgumentError("shine: unknown user field " + key);
+        }
+        AuthUser user;
+        user.auth = getStr(item, "auth"); user.email = getStr(item, "email");
+        if (item["level"].IsDefined()) user.level = item["level"].as<u32>();
+        result.push_back(std::move(user));
+    }
+    return result;
+}
+} // namespace
+
 Status Config::validate() const {
     absl::flat_hash_set<std::string> tags;
     for (const auto& in : inbounds) {
@@ -86,6 +126,12 @@ Status Config::validate() const {
         if (!tags.insert("in:" + in.tag).second)
             return absl::InvalidArgumentError("duplicate inbound tag: " + in.tag);
         if (in.listen.empty()) return absl::InvalidArgumentError("inbound " + in.tag + " missing listen");
+        if (in.protocol == "shine") {
+            if (auto st=validateShineAuth(in.password,in.users,false); !st.ok()) return st;
+            if (auto st=validateShineTransport(in.transport,in.compression,in.init_window); !st.ok()) return st;
+            if (in.max_payload < 64 || in.max_payload > 512ull*1024*1024) return absl::InvalidArgumentError("shine: max_payload must be between 64 bytes and 512 MiB");
+            if (in.handshake_timeout.count() <= 0) return absl::InvalidArgumentError("shine: handshake_timeout must be positive");
+        }
     }
     if (inbounds.empty()) return absl::InvalidArgumentError("no inbounds configured");
 
@@ -96,6 +142,11 @@ Status Config::validate() const {
         if (!out_tags.insert(o.tag).second)
             return absl::InvalidArgumentError("duplicate outbound tag: " + o.tag);
         if (o.protocol == "direct") has_direct = true;
+        if (o.protocol == "shine-client") {
+            if (auto st=validateShineAuth(o.password,o.users,true); !st.ok()) return st;
+            if (auto st=validateShineTransport(o.transport,o.compression,o.init_window); !st.ok()) return st;
+            if (o.handshake_timeout.count() <= 0) return absl::InvalidArgumentError("shine: handshake_timeout must be positive");
+        }
     }
     if (!has_direct) {
         return absl::InvalidArgumentError("at least one direct outbound is required");
@@ -117,6 +168,9 @@ static StatusOr<InboundConfig> parseInbound(const YAML::Node& n) {
     c.protocol = getStr(n, "protocol");
     c.listen   = getStr(n, "listen");
     c.password = getStr(n, "password");
+    c.transport = getStr(n, "transport", c.transport);
+    c.compression = getOr<bool>(n, "compression", false);
+    auto users = parseUsers(n); if (!users.ok()) return users.status(); c.users = std::move(*users);
     c.user     = getStr(n, "user");
     c.pass     = getStr(n, "pass");
     auto mp = parseSizeNode(n, "max_payload", c.max_payload);
@@ -124,6 +178,7 @@ static StatusOr<InboundConfig> parseInbound(const YAML::Node& n) {
     c.max_payload = *mp;
     auto iw = parseSizeNode(n, "init_window", c.init_window);
     if (!iw.ok()) return iw.status();
+    if (*iw > std::numeric_limits<u32>::max()) return absl::InvalidArgumentError("shine: initial window too large");
     c.init_window = static_cast<u32>(*iw);
     auto pi = parseSeconds(n, "ping_interval", c.ping_interval);
     if (!pi.ok()) return pi.status();
@@ -143,11 +198,15 @@ static StatusOr<OutboundConfig> parseOutbound(const YAML::Node& n) {
     c.protocol = getStr(n, "protocol");
     c.server   = getStr(n, "server");
     c.password = getStr(n, "password");
+    c.transport = getStr(n, "transport", c.transport);
+    c.compression = getOr<bool>(n, "compression", false);
+    auto users = parseUsers(n); if (!users.ok()) return users.status(); c.users = std::move(*users);
     c.user     = getStr(n, "user");
     c.pass     = getStr(n, "pass");
     c.pool_size = getOr<int>(n, "pool_size", 1);
     auto iw = parseSizeNode(n, "init_window", c.init_window);
     if (!iw.ok()) return iw.status();
+    if (*iw > std::numeric_limits<u32>::max()) return absl::InvalidArgumentError("shine: initial window too large");
     c.init_window = static_cast<u32>(*iw);
     auto pi = parseSeconds(n, "ping_interval", c.ping_interval);
     if (!pi.ok()) return pi.status();

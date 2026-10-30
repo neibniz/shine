@@ -39,7 +39,7 @@ func (*testDialer) SetOutboundGateway(context.Context, *session.Outbound) {}
 func TestRegisteredConfigsAndLinkReuse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	v, e := common.CreateObject(ctx, &ClientConfig{Address: "127.0.0.1", Port: 9999})
+	v, e := common.CreateObject(ctx, &ClientConfig{Address: "127.0.0.1", Port: 9999, Transport: "tcp"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -129,7 +129,7 @@ func (discardWriter) WriteMultiBuffer(b buf.MultiBuffer) error { buf.ReleaseMult
 func TestUDPStopsWhenXrayInputCloses(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	obj, err := common.CreateObject(ctx, &ClientConfig{Address: "127.0.0.1", Port: 1234})
+	obj, err := common.CreateObject(ctx, &ClientConfig{Address: "127.0.0.1", Port: 1234, Transport: "tcp"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,5 +174,26 @@ func TestAuthenticatedIdentityInContext(t *testing.T) {
 	}
 	if original.User != nil {
 		t.Fatal("original metadata mutated")
+	}
+}
+
+func TestDefaultTransport(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		transport string
+		redis     bool
+	}{{"default", "", true}, {"explicit redis", "redis", true}, {"legacy tcp", "tcp", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			obj, err := common.CreateObject(ctx, &ServerConfig{Transport: tc.transport})
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := obj.(*Inbound)
+			defer in.Close()
+			if (in.carrier != nil) != tc.redis {
+				t.Fatalf("transport %q carrier=%v", tc.transport, in.carrier != nil)
+			}
+		})
 	}
 }

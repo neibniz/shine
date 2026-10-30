@@ -96,7 +96,21 @@ public:
         if (!us_.is_open()) co_return absl::UnavailableError("closed");
         std::string buf;
         buf.push_back(0); buf.push_back(0); buf.push_back(0);
-        buf.append(target.toBinary());
+        if (target.type() == Address::Type::IPv4) {
+            buf.push_back(0x01);
+            buf.append(reinterpret_cast<const char*>(target.bytes().data()), 4);
+        } else if (target.type() == Address::Type::IPv6) {
+            buf.push_back(0x04);
+            buf.append(reinterpret_cast<const char*>(target.bytes().data()), 16);
+        } else {
+            if (target.domain().empty() || target.domain().size() > 255)
+                co_return absl::InvalidArgumentError("invalid SOCKS5 UDP domain");
+            buf.push_back(0x03);
+            buf.push_back(static_cast<char>(target.domain().size()));
+            buf.append(target.domain());
+        }
+        buf.push_back(static_cast<char>(target.port() >> 8));
+        buf.push_back(static_cast<char>(target.port() & 0xff));
         buf.append(reinterpret_cast<const char*>(data.data()), data.size());
 
         boost::system::error_code ec;

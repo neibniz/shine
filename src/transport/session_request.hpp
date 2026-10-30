@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/common.hpp"
+#include "core/auth.hpp"
 #include "transport/address.hpp"
 #include "transport/session_stream.hpp"
 
@@ -19,6 +20,7 @@ struct SessionRequest {
     std::string                       inbound_protocol;
     Protocol                          protocol = Protocol::TCP;
     Address                           target;
+    std::optional<UserIdentity>       authenticated_user;
     std::shared_ptr<ISessionStream>   client_stream;
     std::shared_ptr<IDatagramStream>  client_datagram_stream;
 };

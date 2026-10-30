@@ -2,6 +2,7 @@
 
 #include "core/logging.hpp"
 #include "proto/resp2_writer.hpp"
+#include "transport/tcp_stream.hpp"
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -19,9 +20,17 @@ namespace shine {
 using namespace boost::asio::experimental::awaitable_operators;
 
 Link::Link(tcp::socket sock, LinkOptions opts)
-    : sock_(std::move(sock)), opts_(std::move(opts)),
-      strand_(asio::make_strand(sock_.get_executor())),
-      parser_(opts_.max_payload) {
+    : opts_(std::move(opts)), strand_(asio::make_strand(sock.get_executor())),
+      stream_(std::make_shared<TcpSocketStream>(std::move(sock))), parser_(opts_.max_payload) {
+    write_chan_       = std::make_unique<WriteChan>(strand_, 1024);
+    handshake_signal_ = std::make_unique<HandshakeSignal>(strand_, 1);
+    rng_.seed(static_cast<u64>(nowNs()) ^ reinterpret_cast<std::uintptr_t>(this));
+}
+
+Link::Link(std::shared_ptr<ISessionStream> stream, asio::any_io_executor executor,
+           LinkOptions opts)
+    : opts_(std::move(opts)), strand_(asio::make_strand(std::move(executor))),
+      stream_(std::move(stream)), parser_(opts_.max_payload) {
     write_chan_       = std::make_unique<WriteChan>(strand_, 1024);
     handshake_signal_ = std::make_unique<HandshakeSignal>(strand_, 1);
     rng_.seed(static_cast<u64>(nowNs()) ^ reinterpret_cast<std::uintptr_t>(this));
@@ -59,16 +68,14 @@ void Link::start(NewSessionHandler on_new_session) {
 awaitable<void> Link::handshakeServer() {
     // Expect HELLO, optionally AUTH.
     // Set a handshake timeout via steady_timer race.
-    asio::steady_timer timer(strand_);
-    timer.expires_after(opts_.handshake_timeout);
-    auto timed = [&]() -> awaitable<void> {
+    auto timer = std::make_shared<asio::steady_timer>(strand_);
+    timer->expires_after(opts_.handshake_timeout);
+    auto self = shared_from_this();
+    asio::co_spawn(strand_, [self, timer]() -> awaitable<void> {
         boost::system::error_code ec;
-        co_await timer.async_wait(asio::redirect_error(use_awaitable, ec));
-        if (!ec) {
-            co_await failLink("handshake timeout");
-        }
-    };
-    asio::co_spawn(strand_, timed(), asio::detached);
+        co_await timer->async_wait(asio::redirect_error(use_awaitable, ec));
+        if (!ec) co_await self->failLink("handshake timeout");
+    }, asio::detached);
 
     auto one = [&]() -> awaitable<StatusOr<proto::ShineFrame>> {
         for (;;) {
@@ -76,19 +83,16 @@ awaitable<void> Link::handshakeServer() {
             auto sc = parser_.tryParse(read_buf_, rf);
             if (!sc.ok()) co_return sc.status();
             if (*sc > 0) {
-                read_buf_.consume(*sc);
                 auto sf = proto::decodeShineFrame(rf);
+                read_buf_.consume(*sc);
                 if (!sf.ok()) co_return sf.status();
                 co_return std::move(*sf);
             }
             read_buf_.ensure_writable(8192);
-            boost::system::error_code ec;
-            auto n = co_await sock_.async_read_some(
-                asio::buffer(read_buf_.writable_ptr(), read_buf_.writable_size()),
-                asio::redirect_error(use_awaitable, ec));
-            if (ec) co_return absl::UnavailableError(ec.message());
-            if (n == 0) co_return absl::UnavailableError("eof");
-            read_buf_.committed(n);
+            auto n = co_await stream_->read(std::span<u8>(read_buf_.writable_ptr(), read_buf_.writable_size()));
+            if (!n.ok()) co_return n.status();
+            if (*n == 0) co_return absl::UnavailableError("eof");
+            read_buf_.committed(*n);
         }
     };
 
@@ -102,13 +106,22 @@ awaitable<void> Link::handshakeServer() {
     proto::encodeHello(out, proto::HelloFrame{"1", "mux,flow"});
     co_await enqueueFrame(std::move(out));
 
-    if (!opts_.password.empty()) {
+    if (!opts_.password.empty() || !opts_.users.empty()) {
         auto f2 = co_await one();
         if (!f2.ok()) { co_await failLink(f2.status().message()); co_return; }
         if (!std::holds_alternative<proto::AuthFrame>(*f2)) {
             co_await failLink("expected AUTH"); co_return;
         }
-        if (std::get<proto::AuthFrame>(*f2).password != opts_.password) {
+        const auto& password = std::get<proto::AuthFrame>(*f2).password;
+        bool authenticated = !opts_.password.empty() && authEquals(password, opts_.password);
+        for (const auto& user : opts_.users) {
+            if (authEquals(password, user.auth)) {
+                authenticated = true;
+                identity_ = UserIdentity{user.email, user.level};
+            }
+        }
+        if (authenticated && opts_.users.empty()) identity_ = UserIdentity{};
+        if (!authenticated) {
             std::string err;
             proto::encodeErr(err, proto::ErrFrame{"AUTH", "bad password"});
             co_await enqueueFrame(std::move(err));
@@ -118,7 +131,7 @@ awaitable<void> Link::handshakeServer() {
         proto::encodeOk(ok);
         co_await enqueueFrame(std::move(ok));
     }
-    timer.cancel();
+    timer->cancel();
 }
 
 awaitable<void> Link::handshakeClient() {
@@ -126,16 +139,14 @@ awaitable<void> Link::handshakeClient() {
     proto::encodeHello(out, proto::HelloFrame{"1", "mux,flow"});
     co_await enqueueFrame(std::move(out));
 
-    asio::steady_timer timer(strand_);
-    timer.expires_after(opts_.handshake_timeout);
-    auto timed = [&]() -> awaitable<void> {
+    auto timer = std::make_shared<asio::steady_timer>(strand_);
+    timer->expires_after(opts_.handshake_timeout);
+    auto self = shared_from_this();
+    asio::co_spawn(strand_, [self, timer]() -> awaitable<void> {
         boost::system::error_code ec;
-        co_await timer.async_wait(asio::redirect_error(use_awaitable, ec));
-        if (!ec) {
-            co_await failLink("handshake timeout");
-        }
-    };
-    asio::co_spawn(strand_, timed(), asio::detached);
+        co_await timer->async_wait(asio::redirect_error(use_awaitable, ec));
+        if (!ec) co_await self->failLink("handshake timeout");
+    }, asio::detached);
 
     auto one = [&]() -> awaitable<StatusOr<proto::ShineFrame>> {
         for (;;) {
@@ -143,19 +154,16 @@ awaitable<void> Link::handshakeClient() {
             auto sc = parser_.tryParse(read_buf_, rf);
             if (!sc.ok()) co_return sc.status();
             if (*sc > 0) {
-                read_buf_.consume(*sc);
                 auto sf = proto::decodeShineFrame(rf);
+                read_buf_.consume(*sc);
                 if (!sf.ok()) co_return sf.status();
                 co_return std::move(*sf);
             }
             read_buf_.ensure_writable(8192);
-            boost::system::error_code ec;
-            auto n = co_await sock_.async_read_some(
-                asio::buffer(read_buf_.writable_ptr(), read_buf_.writable_size()),
-                asio::redirect_error(use_awaitable, ec));
-            if (ec) co_return absl::UnavailableError(ec.message());
-            if (n == 0) co_return absl::UnavailableError("eof");
-            read_buf_.committed(n);
+            auto n = co_await stream_->read(std::span<u8>(read_buf_.writable_ptr(), read_buf_.writable_size()));
+            if (!n.ok()) co_return n.status();
+            if (*n == 0) co_return absl::UnavailableError("eof");
+            read_buf_.committed(*n);
         }
     };
 
@@ -177,7 +185,7 @@ awaitable<void> Link::handshakeClient() {
             co_await failLink("expected OK after AUTH"); co_return;
         }
     }
-    timer.cancel();
+    timer->cancel();
 }
 
 awaitable<void> Link::readerLoop() {
@@ -190,14 +198,11 @@ awaitable<void> Link::readerLoop() {
         }
         if (*sc == 0) {
             read_buf_.ensure_writable(16 * 1024);
-            boost::system::error_code ec;
-            auto n = co_await sock_.async_read_some(
-                asio::buffer(read_buf_.writable_ptr(), read_buf_.writable_size()),
-                asio::redirect_error(use_awaitable, ec));
-            if (ec || n == 0) {
-                co_await failLink(ec ? ec.message() : "eof"); co_return;
+            auto n = co_await stream_->read(std::span<u8>(read_buf_.writable_ptr(), read_buf_.writable_size()));
+            if (!n.ok() || *n == 0) {
+                co_await failLink(n.ok() ? "eof" : n.status().message()); co_return;
             }
-            read_buf_.committed(n);
+            read_buf_.committed(*n);
             continue;
         }
         auto frame = proto::decodeShineFrame(rf);
@@ -216,11 +221,10 @@ awaitable<void> Link::writerLoop() {
         auto msg = co_await write_chan_->async_receive(asio::redirect_error(use_awaitable, ec));
         if (ec) co_return;
         if (msg.empty()) continue;
-        co_await asio::async_write(sock_, asio::buffer(msg),
-                                   asio::redirect_error(use_awaitable, ec));
-        if (ec) {
-            SHINE_WARN("link writer error peer={}: {}", opts_.peer_label, ec.message());
-            co_await failLink(ec.message()); co_return;
+        auto st = co_await stream_->write(std::span<const u8>(reinterpret_cast<const u8*>(msg.data()), msg.size()));
+        if (!st.ok()) {
+            SHINE_WARN("link writer error peer={}: {}", opts_.peer_label, st.message());
+            co_await failLink(st.message()); co_return;
         }
     }
 }
@@ -422,9 +426,7 @@ awaitable<void> Link::gracefulShutdown(std::chrono::seconds drain_timeout) {
 awaitable<void> Link::failLink(absl::string_view reason) {
     if (closed_.exchange(true, std::memory_order_acq_rel)) co_return;
     SHINE_DEBUG("link closed peer={} reason={}", opts_.peer_label, reason);
-    boost::system::error_code ec;
-    sock_.shutdown(tcp::socket::shutdown_both, ec);
-    sock_.close(ec);
+    stream_->close();
     write_chan_->close();
     if (handshake_signal_) handshake_signal_->close();
     std::vector<SessionPtr> all;
@@ -439,8 +441,7 @@ awaitable<void> Link::failLink(absl::string_view reason) {
 
 void Link::markClosed() {
     closed_.store(true, std::memory_order_release);
-    boost::system::error_code ec;
-    sock_.close(ec);
+    if (stream_) stream_->close();
     if (write_chan_) write_chan_->close();
 }
 
@@ -448,11 +449,16 @@ void Link::closeNow() {
     if (closed_.exchange(true, std::memory_order_acq_rel)) return;
     // Post to strand to avoid concurrent socket access from reader/writer.
     asio::post(strand_, [self = shared_from_this()]() {
-        boost::system::error_code ec;
-        self->sock_.shutdown(tcp::socket::shutdown_both, ec);
-        self->sock_.close(ec);
+        self->stream_->close();
         if (self->write_chan_) self->write_chan_->close();
         if (self->handshake_signal_) self->handshake_signal_->close();
+        std::vector<SessionPtr> all;
+        {
+            absl::MutexLock lock(&self->sessions_mu_);
+            for (auto& kv : self->sessions_) all.push_back(kv.second);
+            self->sessions_.clear();
+        }
+        for (auto& session : all) session->onReset();
     });
 }
 

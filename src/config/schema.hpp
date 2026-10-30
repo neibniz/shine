@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/common.hpp"
+#include "core/auth.hpp"
 
 #include <absl/container/flat_hash_map.h>
 
@@ -17,7 +18,10 @@ struct InboundConfig {
     std::string tag;
     std::string protocol;                // socks5 | http-connect | shine
     std::string listen;                  // "host:port"
-    std::string password;                // shine only
+    std::string password;                // legacy single Shine credential
+    std::vector<AuthUser> users;
+    std::string transport = "redis";     // redis | tcp
+    bool compression = false;
     std::size_t max_payload     = 512ull * 1024 * 1024;
     std::chrono::seconds ping_interval{15};
     std::chrono::seconds pong_timeout{10};
@@ -33,6 +37,9 @@ struct OutboundConfig {
     std::string protocol;                // direct | shine-client | socks5 | http-connect
     std::string server;                  // "host:port" for client-mode
     std::string password;
+    std::vector<AuthUser> users;
+    std::string transport = "redis";     // redis | tcp
+    bool compression = false;
     std::size_t pool_size   = 1;
     std::chrono::seconds ping_interval{15};
     std::chrono::seconds pong_timeout{10};

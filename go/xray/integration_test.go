@@ -1,6 +1,8 @@
 package xray
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -124,6 +126,11 @@ func probe(t *testing.T, target string) (int, *atomic.Int32) {
 }
 
 func TestXrayEndToEnd(t *testing.T) {
+	for _, mode := range []string{"tcp", "redis-default", "redis-default-uncompressed", "redis-explicit"} {
+		t.Run(mode, func(t *testing.T) { testXrayEndToEnd(t, mode) })
+	}
+}
+func testXrayEndToEnd(t *testing.T, mode string) {
 	if os.Getenv("SHINE_XRAY_BIN") == "" {
 		t.Skip("set SHINE_XRAY_BIN to a patched Xray executable")
 	}
@@ -162,7 +169,44 @@ func TestXrayEndToEnd(t *testing.T) {
 	server := map[string]any{"log": map[string]any{"loglevel": "warning"}, "inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": serverPort, "protocol": "shine", "settings": map[string]any{"users": serverUsers}}}, "outbounds": []any{map[string]any{"protocol": "blackhole", "tag": "blocked"}, map[string]any{"protocol": "freedom", "tag": "direct"}}, "routing": map[string]any{"rules": []any{map[string]any{"type": "field", "user": []string{"alice@example.com"}, "outboundTag": "direct"}}}}
 	clientUsers := []any{map[string]any{"auth": password, "email": "alice@example.com", "level": 2}}
 	client := map[string]any{"log": map[string]any{"loglevel": "warning"}, "inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": clientPort, "protocol": "socks", "settings": map[string]any{"udp": true}}}, "outbounds": []any{map[string]any{"protocol": "shine", "settings": map[string]any{"address": "127.0.0.1", "port": serverPort, "users": clientUsers}}}}
+	serverSettings := server["inbounds"].([]any)[0].(map[string]any)["settings"].(map[string]any)
+	clientSettings := client["outbounds"].([]any)[0].(map[string]any)["settings"].(map[string]any)
+	redisMode := mode != "tcp"
+	if redisMode {
+		if mode != "redis-default-uncompressed" {
+			serverSettings["compression"], clientSettings["compression"] = true, true
+		}
+		if mode == "redis-explicit" {
+			serverSettings["transport"], clientSettings["transport"] = "redis", "redis"
+		}
+	} else {
+		serverSettings["transport"], clientSettings["transport"] = "tcp", "tcp"
+	}
 	launchXray(t, server, serverPort)
+	if redisMode {
+		probeConn, err := net.DialTimeout("tcp4", fmt.Sprintf("127.0.0.1:%d", serverPort), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		probeConn.SetDeadline(time.Now().Add(3 * time.Second))
+		reader := bufio.NewReader(probeConn)
+		commands := []struct{ wire, reply string }{
+			{fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(password), password), "+OK\r\n"},
+			{"*1\r\n$4\r\nPING\r\n", "+PONG\r\n"},
+			{"*3\r\n$3\r\nSET\r\n$5\r\nprobe\r\n$5\r\nvalue\r\n", "+OK\r\n"},
+			{"*2\r\n$3\r\nGET\r\n$5\r\nprobe\r\n", "$5\r\nvalue\r\n"},
+		}
+		for _, cmd := range commands {
+			if _, err = probeConn.Write([]byte(cmd.wire)); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(cmd.reply))
+			if _, err = io.ReadFull(reader, got); err != nil || string(got) != cmd.reply {
+				t.Fatalf("Redis command response %q: %v", got, err)
+			}
+		}
+		probeConn.Close()
+	}
 	proxyPort, physicalCount := probe(t, fmt.Sprintf("127.0.0.1:%d", serverPort))
 	client["outbounds"].([]any)[0].(map[string]any)["settings"].(map[string]any)["port"] = proxyPort
 	launchXray(t, client, clientPort)
@@ -263,6 +307,18 @@ func TestXrayEndToEnd(t *testing.T) {
 			t.Fatalf("reply %q %v", got, err)
 		}
 	})
+	largeConn, _ := socksConn(t, clientPort, 1, echo.Addr().(*net.TCPAddr))
+	large := bytes.Repeat([]byte("compressible-data"), 32768)
+	writeErr := make(chan error, 1)
+	go func() { _, err := largeConn.Write(large); writeErr <- err }()
+	largeReply := make([]byte, len(large))
+	if _, err := io.ReadFull(largeConn, largeReply); err != nil || !bytes.Equal(largeReply, large) {
+		t.Fatalf("large echo: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+	largeConn.Close()
 	control, reply := socksConn(t, clientPort, 3, &net.TCPAddr{IP: net.IPv4zero, Port: 0})
 	defer control.Close()
 	port := int(binary.BigEndian.Uint16(reply[8:10]))
@@ -304,7 +360,98 @@ func TestXrayEndToEnd(t *testing.T) {
 	if err != nil || string(b[:n]) != string(secondPacket) {
 		t.Fatalf("second UDP reply %x: %v", b[:n], err)
 	}
-	if n := physicalCount.Load(); n != 1 {
-		t.Fatalf("expected one shared Shine link, got %d", n)
+	expected := int32(1)
+	if redisMode {
+		expected = 2
 	}
+	if n := physicalCount.Load(); n != expected {
+		t.Fatalf("expected %d shared transport connections, got %d", expected, n)
+	}
+}
+
+// Exercises the compiled C++ proxy against an actual Xray binary in both roles.
+func TestXrayCPPInterop(t *testing.T) {
+	if os.Getenv("SHINE_CPP_BIN") == "" || os.Getenv("SHINE_XRAY_BIN") == "" {
+		t.Skip("set SHINE_CPP_BIN and SHINE_XRAY_BIN")
+	}
+	for _, direction := range []string{"cpp-server", "xray-server"} {
+		for _, mode := range []string{"tcp", "redis"} {
+			t.Run(direction+"/"+mode, func(t *testing.T) {
+				echo, err := net.Listen("tcp4", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer echo.Close()
+				go func() {
+					for {
+						c, e := echo.Accept()
+						if e != nil {
+							return
+						}
+						go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
+					}
+				}()
+				serverPort, clientPort, metricsPort := freePort(t), freePort(t), freePort(t)
+				password := "cpp-xray-interop"
+				users := []any{map[string]any{"auth": password, "email": "alice@example.com"}}
+				settings := map[string]any{"users": users}
+				if mode == "tcp" {
+					settings["transport"] = "tcp"
+				} else {
+					settings["compression"] = true
+				}
+				var cppConfig string
+				if direction == "cpp-server" {
+					cppConfig = fmt.Sprintf("metrics:\n  listen: 127.0.0.1:%d\ninbounds:\n  - tag: in\n    protocol: shine\n    listen: 127.0.0.1:%d\n    password: %s\n    transport: %s\n    compression: %t\noutbounds:\n  - tag: direct\n    protocol: direct\nroute:\n  default: direct\n", metricsPort, serverPort, password, mode, mode == "redis")
+					launchCPPInterop(t, cppConfig, serverPort)
+					settings["address"] = "127.0.0.1"
+					settings["port"] = serverPort
+					client := map[string]any{"log": map[string]any{"loglevel": "warning"}, "inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": clientPort, "protocol": "socks"}}, "outbounds": []any{map[string]any{"protocol": "shine", "settings": settings}}}
+					launchXray(t, client, clientPort)
+				} else {
+					server := map[string]any{"log": map[string]any{"loglevel": "warning"}, "inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": serverPort, "protocol": "shine", "settings": settings}}, "outbounds": []any{map[string]any{"protocol": "freedom"}}}
+					launchXray(t, server, serverPort)
+					cppConfig = fmt.Sprintf("metrics:\n  listen: 127.0.0.1:%d\ninbounds:\n  - tag: in\n    protocol: socks5\n    listen: 127.0.0.1:%d\noutbounds:\n  - tag: direct\n    protocol: direct\n  - tag: proxy\n    protocol: shine-client\n    server: 127.0.0.1:%d\n    users:\n      - auth: %s\n        email: alice@example.com\n    transport: %s\n    compression: %t\nroute:\n  default: proxy\n", metricsPort, clientPort, serverPort, password, mode, mode == "redis")
+					launchCPPInterop(t, cppConfig, clientPort)
+				}
+				c, _ := socksConn(t, clientPort, 1, echo.Addr().(*net.TCPAddr))
+				defer c.Close()
+				data := bytes.Repeat([]byte("cross-language-xray "), 8192)
+				done := make(chan error, 1)
+				go func() { _, e := c.Write(data); done <- e }()
+				got := make([]byte, len(data))
+				if _, err = io.ReadFull(c, got); err != nil || !bytes.Equal(got, data) {
+					t.Fatalf("echo: %v", err)
+				}
+				if err = <-done; err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+func launchCPPInterop(t *testing.T, config string, port int) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "shine.yaml")
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	cmd := exec.Command(os.Getenv("SHINE_CPP_BIN"), "-c", path)
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if err == nil {
+			c.Close()
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("C++ proxy failed to start: %s", output.String())
 }

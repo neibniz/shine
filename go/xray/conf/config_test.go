@@ -31,6 +31,25 @@ func TestConfigJSONAndProtoRegistration(t *testing.T) {
 	}
 }
 func TestCredentialConfig(t *testing.T) {
+	// Transport options are validated at config load time.
+	for _, tc := range []struct {
+		json  string
+		valid bool
+	}{
+		{`{"compression":true,"users":[{"auth":"a"}]}`, true},
+		{`{"transport":"redis","compression":true,"users":[{"auth":"a"}]}`, true},
+		{`{"transport":"tcp","compression":true,"users":[{"auth":"a"}]}`, false},
+		{`{"transport":"unknown","users":[{"auth":"a"}]}`, false},
+	} {
+		var c InboundConfig
+		err := json.Unmarshal([]byte(tc.json), &c)
+		if err == nil {
+			_, err = c.Build()
+		}
+		if (err == nil) != tc.valid {
+			t.Fatalf("transport %s: %v", tc.json, err)
+		}
+	}
 	serverCases := []struct {
 		name, config string
 		wantErr      bool

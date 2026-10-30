@@ -4,6 +4,7 @@
 #include "transport/address.hpp"
 #include "transport/pipe.hpp"
 #include "transport/tcp_stream.hpp"
+#include "redis/stream.hpp"
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -21,25 +22,35 @@ awaitable<LinkPtr> ShineOutbound::dialNewLink() {
         SHINE_WARN("resolve {} failed: {}", cfg_.server, ep.status().message());
         co_return nullptr;
     }
-    tcp::socket sock(ex_);
-    boost::system::error_code ec;
-    co_await sock.async_connect(*ep, asio::redirect_error(use_awaitable, ec));
-    if (ec) {
-        SHINE_WARN("shine-outbound connect {} failed: {}", cfg_.server, ec.message());
-        co_return nullptr;
-    }
-    sock.set_option(tcp::no_delay(true), ec);
-
     LinkOptions lo;
     lo.peer_label        = cfg_.server;
-    lo.password          = cfg_.password;
+    lo.password          = cfg_.users.empty() ? cfg_.password : cfg_.users[0].auth;
     lo.init_window       = cfg_.init_window;
     lo.ping_interval     = cfg_.ping_interval;
     lo.pong_timeout      = cfg_.pong_timeout;
     lo.handshake_timeout = cfg_.handshake_timeout;
     lo.is_server         = false;
 
-    auto link = std::make_shared<Link>(std::move(sock), std::move(lo));
+    LinkPtr link;
+    if (cfg_.transport == "redis") {
+        auto strand = asio::make_strand(ex_);
+        auto carrier = co_await asio::co_spawn(strand, redis::dial(strand, *ep, lo.password, cfg_.compression, cfg_.handshake_timeout), use_awaitable);
+        if (!carrier.ok()) {
+            SHINE_WARN("shine-outbound redis connection to {} failed: {}", cfg_.server, carrier.status().message());
+            co_return nullptr;
+        }
+        link = std::make_shared<Link>(carrier->stream, carrier->executor, std::move(lo));
+    } else {
+        tcp::socket sock(ex_);
+        boost::system::error_code ec;
+        co_await sock.async_connect(*ep, asio::redirect_error(use_awaitable, ec));
+        if (ec) {
+            SHINE_WARN("shine-outbound connect {} failed: {}", cfg_.server, ec.message());
+            co_return nullptr;
+        }
+        sock.set_option(tcp::no_delay(true), ec);
+        link = std::make_shared<Link>(std::move(sock), std::move(lo));
+    }
     // Client links don't accept NEW from peer.
     link->start({});
     co_return link;

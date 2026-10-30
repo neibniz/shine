@@ -55,5 +55,5 @@ route:
         - "geoip:cn"
       outbound: direct
     - cidr: [127.0.0.0/8, ::1/128, 10.0.0.0/8, 192.168.0.0/16]
-      outbound: block
+      outbound: deny
   default: direct

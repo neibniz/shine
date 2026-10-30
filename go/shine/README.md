@@ -88,6 +88,15 @@ The v1 wire format transmits only the auth secret. The server maps it to its
 local email and level, so email alone is not a credential. Existing Shine peers
 can authenticate without a wire-format change.
 
+## Redis-like transport
+
+The optional [Redis-like transport](redis/README.md) wraps the Shine byte stream
+in RESP2 publish/subscribe-style messages. It uses two connections and can apply
+zlib compression when that reduces a message's size. It is opt-in, does not add
+encryption, and requires support on both sides; the ordinary Go library TCP
+transport is unchanged. The Xray adapter selects the Redis-style transport by
+default when its `transport` setting is omitted.
+
 ## Embedding and lifecycle
 
 - `Client` and `Server` accept an established `io.ReadWriteCloser` and take

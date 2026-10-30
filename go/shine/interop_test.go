@@ -1,6 +1,7 @@
 package shine
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hhhflow2020/shine/go/shine/redis"
 )
 
 // Set SHINE_CPP_BIN to run these tests against a separately built C++ executable.
@@ -55,6 +58,11 @@ func unusedAddr(t *testing.T) string {
 	return a
 }
 func TestInteropGoClientCPPServer(t *testing.T) {
+	for _, mode := range []string{"tcp", "redis", "redis-compressed"} {
+		t.Run(mode, func(t *testing.T) { interopGoClientCPPServer(t, mode) })
+	}
+}
+func interopGoClientCPPServer(t *testing.T, mode string) {
 	if os.Getenv("SHINE_CPP_BIN") == "" {
 		t.Skip("set SHINE_CPP_BIN to test C++ interoperability")
 	}
@@ -73,14 +81,24 @@ func TestInteropGoClientCPPServer(t *testing.T) {
 		}
 	}()
 	addr := unusedAddr(t)
-	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: in\n    protocol: shine\n    listen: %q\n    password: secret\noutbounds:\n  - tag: direct\n    protocol: direct\nroute:\n  default: direct\n", unusedAddr(t), addr)
+	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: in\n    protocol: shine\n    listen: %q\n    users:\n      - auth: secret\n        email: cpp@example.com\n    transport: %s\n    compression: %t\noutbounds:\n  - tag: direct\n    protocol: direct\nroute:\n  default: direct\n", unusedAddr(t), addr, carrierName(mode), mode == "redis-compressed")
+	if mode == "redis" {
+		cfg = strings.Replace(cfg, "    transport: redis\n", "", 1)
+	}
 	startCPP(t, cfg, addr)
-	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var conn io.ReadWriteCloser
+	if mode == "tcp" {
+		conn, err = net.DialTimeout("tcp", addr, time.Second)
+	} else {
+		conn, err = redis.Client(ctx, func(ctx context.Context) (io.ReadWriteCloser, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		}, redis.Options{Password: "secret", Compression: mode == "redis-compressed"})
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	link, err := Client(ctx, conn, Options{Password: "secret"})
 	if err != nil {
 		t.Fatal(err)
@@ -145,6 +163,11 @@ func TestInteropGoClientCPPServer(t *testing.T) {
 	}
 }
 func TestInteropCPPClientGoServer(t *testing.T) {
+	for _, mode := range []string{"tcp", "redis", "redis-compressed"} {
+		t.Run(mode, func(t *testing.T) { interopCPPClientGoServer(t, mode) })
+	}
+}
+func interopCPPClientGoServer(t *testing.T, mode string) {
 	if os.Getenv("SHINE_CPP_BIN") == "" {
 		t.Skip("set SHINE_CPP_BIN to test C++ interoperability")
 	}
@@ -159,7 +182,7 @@ func TestInteropCPPClientGoServer(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	go func() {
-		conn, e := listener.Accept()
+		conn, e := acceptInterop(ctx, listener, mode)
 		if e != nil {
 			handled <- e
 			return
@@ -191,7 +214,10 @@ func TestInteropCPPClientGoServer(t *testing.T) {
 		<-release
 	}()
 	addr := unusedAddr(t)
-	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: socks\n    protocol: socks5\n    listen: %q\noutbounds:\n  - tag: direct\n    protocol: direct\n  - tag: proxy\n    protocol: shine-client\n    server: %q\n    password: secret\nroute:\n  default: proxy\n", unusedAddr(t), addr, listener.Addr().String())
+	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: socks\n    protocol: socks5\n    listen: %q\noutbounds:\n  - tag: direct\n    protocol: direct\n  - tag: proxy\n    protocol: shine-client\n    server: %q\n    users:\n      - auth: secret\n        email: cpp@example.com\n    transport: %s\n    compression: %t\nroute:\n  default: proxy\n", unusedAddr(t), addr, listener.Addr().String(), carrierName(mode), mode == "redis-compressed")
+	if mode == "redis" {
+		cfg = strings.Replace(cfg, "    transport: redis\n", "", 1)
+	}
 	startCPP(t, cfg, addr)
 	c, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
@@ -229,6 +255,11 @@ func TestInteropCPPClientGoServer(t *testing.T) {
 }
 
 func TestInteropCPPClientGoServerUDP(t *testing.T) {
+	for _, mode := range []string{"tcp", "redis", "redis-compressed"} {
+		t.Run(mode, func(t *testing.T) { interopCPPClientGoServerUDP(t, mode) })
+	}
+}
+func interopCPPClientGoServerUDP(t *testing.T, mode string) {
 	if os.Getenv("SHINE_CPP_BIN") == "" {
 		t.Skip("set SHINE_CPP_BIN to test C++ interoperability")
 	}
@@ -243,7 +274,7 @@ func TestInteropCPPClientGoServerUDP(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	go func() {
-		conn, e := listener.Accept()
+		conn, e := acceptInterop(ctx, listener, mode)
 		if e != nil {
 			handled <- e
 			return
@@ -278,7 +309,10 @@ func TestInteropCPPClientGoServerUDP(t *testing.T) {
 		<-release
 	}()
 	addr := unusedAddr(t)
-	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: socks\n    protocol: socks5\n    listen: %q\noutbounds:\n  - tag: direct\n    protocol: direct\n  - tag: proxy\n    protocol: shine-client\n    server: %q\n    password: secret\nroute:\n  default: proxy\n", unusedAddr(t), addr, listener.Addr().String())
+	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: socks\n    protocol: socks5\n    listen: %q\noutbounds:\n  - tag: direct\n    protocol: direct\n  - tag: proxy\n    protocol: shine-client\n    server: %q\n    users:\n      - auth: secret\n        email: cpp@example.com\n    transport: %s\n    compression: %t\nroute:\n  default: proxy\n", unusedAddr(t), addr, listener.Addr().String(), carrierName(mode), mode == "redis-compressed")
+	if mode == "redis" {
+		cfg = strings.Replace(cfg, "    transport: redis\n", "", 1)
+	}
 	startCPP(t, cfg, addr)
 	c, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
@@ -313,13 +347,215 @@ func TestInteropCPPClientGoServerUDP(t *testing.T) {
 	}
 	buf := make([]byte, 128)
 	n, err := u.Read(buf)
-	// Current C++ SOCKS5 UDP output incorrectly includes Shine's IP length byte.
-	// Check the actual existing behavior here; it is not a valid SOCKS5 IPv4 header.
-	expected := append([]byte{0, 0, 0, 1, 4, 8, 8, 8, 8, 0, 53}, []byte("udp payload")...)
+	expected := append([]byte{0, 0, 0, 1, 8, 8, 8, 8, 0, 53}, []byte("udp payload")...)
 	if err != nil || string(buf[:n]) != string(expected) {
 		t.Fatalf("SOCKS UDP response %x: %v", buf[:n], err)
 	}
 	if err = <-handled; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func carrierName(mode string) string {
+	if mode == "tcp" {
+		return "tcp"
+	}
+	return "redis"
+}
+func acceptInterop(ctx context.Context, listener net.Listener, mode string) (io.ReadWriteCloser, error) {
+	if mode == "tcp" {
+		return listener.Accept()
+	}
+	acceptor, err := redis.NewAcceptor(redis.Options{Compression: mode == "redis-compressed"}, true, func(p string) bool { return p == "secret" })
+	if err != nil {
+		return nil, err
+	}
+	type result struct {
+		conn io.ReadWriteCloser
+		err  error
+	}
+	results := make(chan result, 1)
+	go func() {
+		for {
+			c, e := listener.Accept()
+			if e != nil {
+				return
+			}
+			go func() {
+				stream, e := acceptor.AcceptConn(ctx, c)
+				if stream != nil || e != nil {
+					select {
+					case results <- result{stream, e}:
+					case <-ctx.Done():
+					}
+				}
+			}()
+		}
+	}()
+	select {
+	case r := <-results:
+		return r.conn, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestInteropCPPRedisCommandsAndAuthentication(t *testing.T) {
+	addr := unusedAddr(t)
+	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: in\n    protocol: shine\n    listen: %q\n    users:\n      - auth: first-secret\n        email: first@example.com\n      - auth: second-secret\n        email: second@example.com\noutbounds:\n  - tag: direct\n    protocol: direct\nroute:\n  default: direct\n", unusedAddr(t), addr)
+	startCPP(t, cfg, addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dial := func(ctx context.Context) (io.ReadWriteCloser, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	for _, secret := range []string{"first-secret", "second-secret"} {
+		c, err := redis.Client(ctx, dial, redis.Options{Password: secret})
+		if err != nil {
+			t.Fatalf("valid credential %q: %v", secret, err)
+		}
+		c.Close()
+	}
+	if c, err := redis.Client(ctx, dial, redis.Options{Password: "wrong"}); err == nil {
+		c.Close()
+		t.Fatal("incorrect credential accepted")
+	}
+	c, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	r := bufio.NewReader(c)
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"PING"}, "-NOAUTH Authentication required.\r\n"},
+		{[]string{"AUTH", "first-secret"}, "+OK\r\n"},
+		{[]string{"PING"}, "+PONG\r\n"},
+		{[]string{"SET", "colour", "blue"}, "+OK\r\n"},
+		{[]string{"GET", "colour"}, "$4\r\nblue\r\n"},
+		{[]string{"SET", "colour", "red", "NX"}, "$-1\r\n"},
+		{[]string{"SELECT", "1"}, "+OK\r\n"},
+		{[]string{"GET", "colour"}, "$-1\r\n"},
+		{[]string{"PUBLISH", "ordinary", "data"}, ":0\r\n"},
+		{[]string{"CLIENT", "SETNAME", "demo"}, "+OK\r\n"},
+		{[]string{"CLIENT", "GETNAME"}, "$4\r\ndemo\r\n"},
+		{[]string{"QUIT"}, "+OK\r\n"},
+	}
+	for _, tc := range cases {
+		var request strings.Builder
+		fmt.Fprintf(&request, "*%d\r\n", len(tc.args))
+		for _, arg := range tc.args {
+			fmt.Fprintf(&request, "$%d\r\n%s\r\n", len(arg), arg)
+		}
+		if _, err := io.WriteString(c, request.String()); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(tc.want))
+		if _, err := io.ReadFull(r, got); err != nil || string(got) != tc.want {
+			t.Fatalf("%v: got %q, want %q: %v", tc.args, got, tc.want, err)
+		}
+	}
+}
+
+func TestInteropCPPRedisPairCredentialsAndMalformedPayload(t *testing.T) {
+	addr := unusedAddr(t)
+	cfg := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: in\n    protocol: shine\n    listen: %q\n    users:\n      - auth: first\n      - auth: second\noutbounds:\n  - tag: direct\n    protocol: direct\nroute:\n  default: direct\n", unusedAddr(t), addr)
+	startCPP(t, cfg, addr)
+	down, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer down.Close()
+	_ = down.SetDeadline(time.Now().Add(4 * time.Second))
+	up, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+	_ = up.SetDeadline(time.Now().Add(4 * time.Second))
+	command := func(c net.Conn, expected string, parts ...string) {
+		t.Helper()
+		var wire strings.Builder
+		fmt.Fprintf(&wire, "*%d\r\n", len(parts))
+		for _, p := range parts {
+			fmt.Fprintf(&wire, "$%d\r\n%s\r\n", len(p), p)
+		}
+		if _, err := io.WriteString(c, wire.String()); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(expected))
+		if _, err := io.ReadFull(c, got); err != nil || string(got) != expected {
+			t.Fatalf("%q: got %q want %q: %v", parts, got, expected, err)
+		}
+	}
+	command(down, "+OK\r\n", "AUTH", "first")
+	command(down, "*3\r\n$9\r\nsubscribe\r\n$15\r\nevents:test:out\r\n:1\r\n", "SUBSCRIBE", "events:test:out")
+	command(up, "+OK\r\n", "AUTH", "second")
+	command(up, ":0\r\n", "PUBLISH", "events:test:in", "")
+	command(up, "+OK\r\n", "AUTH", "first")
+	command(up, ":1\r\n", "PUBLISH", "events:test:in", "")
+	command(up, ":1\r\n", "PUBLISH", "events:test:in", "\x02invalid-envelope")
+	b := make([]byte, 1)
+	if _, err := up.Read(b); err == nil {
+		t.Fatal("invalid payload did not close the connection")
+	}
+}
+
+func TestInteropCPPClientCPPServer(t *testing.T) {
+	if os.Getenv("SHINE_CPP_BIN") == "" {
+		t.Skip("set SHINE_CPP_BIN to test C++ interoperability")
+	}
+	echo, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, e := echo.Accept()
+			if e != nil {
+				return
+			}
+			go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
+		}
+	}()
+	serverAddr, clientAddr := unusedAddr(t), unusedAddr(t)
+	server := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: in\n    protocol: shine\n    listen: %q\n    users:\n      - auth: secret\n        email: cpp@example.com\n    compression: true\noutbounds:\n  - tag: direct\n    protocol: direct\nroute:\n  default: direct\n", unusedAddr(t), serverAddr)
+	client := fmt.Sprintf("metrics:\n  listen: %q\ninbounds:\n  - tag: in\n    protocol: socks5\n    listen: %q\noutbounds:\n  - tag: direct\n    protocol: direct\n  - tag: proxy\n    protocol: shine-client\n    server: %q\n    users:\n      - auth: secret\n    compression: true\nroute:\n  default: proxy\n", unusedAddr(t), clientAddr, serverAddr)
+	startCPP(t, server, serverAddr)
+	startCPP(t, client, clientAddr)
+	c, err := net.DialTimeout("tcp", clientAddr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err = c.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 2)
+	if _, err = io.ReadFull(c, b); err != nil || b[1] != 0 {
+		t.Fatalf("SOCKS greeting %x: %v", b, err)
+	}
+	port := echo.Addr().(*net.TCPAddr).Port
+	if _, err = c.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1, byte(port >> 8), byte(port)}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 10)
+	if _, err = io.ReadFull(c, reply); err != nil || reply[1] != 0 {
+		t.Fatalf("SOCKS connect %x: %v", reply, err)
+	}
+	want := bytes.Repeat([]byte("cpp-transport"), 4096)
+	done := make(chan error, 1)
+	go func() { _, e := c.Write(want); done <- e }()
+	got := make([]byte, len(want))
+	if _, err = io.ReadFull(c, got); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("echo: %v", err)
+	}
+	if err = <-done; err != nil {
 		t.Fatal(err)
 	}
 }

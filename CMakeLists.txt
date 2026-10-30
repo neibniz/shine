@@ -36,6 +36,7 @@ find_package(prometheus-cpp REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(fmt REQUIRED)
+find_package(ZLIB REQUIRED)
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_BINARY_DIR}/src)
@@ -75,8 +76,12 @@ add_library(shine_transport STATIC
     src/transport/session.cpp
     src/transport/pipe.cpp
     src/transport/tcp_stream.cpp
+    src/redis/resp.cpp
+    src/redis/stream.cpp
+    src/redis/fake.cpp
+    src/redis/acceptor.cpp
 )
-target_link_libraries(shine_transport PUBLIC shine_proto)
+target_link_libraries(shine_transport PUBLIC shine_proto ZLIB::ZLIB)
 
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS src/proto/v2ray.proto)
 
@@ -145,11 +150,13 @@ if(SHINE_WITH_TESTS)
         tests/address_test.cpp
         tests/route_test.cpp
         tests/flow_control_test.cpp
+        tests/redis_test.cpp
     )
     target_link_libraries(shine_tests PRIVATE
         shine_proto
         shine_transport
         shine_route
+        shine_config
         GTest::gtest
         GTest::gtest_main
     )

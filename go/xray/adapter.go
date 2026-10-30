@@ -3,6 +3,7 @@ package xray
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	shine "github.com/hhhflow2020/shine/go/shine"
+	rediswire "github.com/hhhflow2020/shine/go/shine/redis"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	xerrors "github.com/xtls/xray-core/common/errors"
@@ -52,6 +54,9 @@ func (u *UserIdentity) ToProto() proto.Message { return u }
 
 // ValidateServerConfig validates credentials and protocol limits.
 func ValidateServerConfig(c *ServerConfig) error {
+	if err := validateTransport(c.Transport, c.Compression); err != nil {
+		return err
+	}
 	if err := ValidateSettings(c.MaxFrameSize, c.MaxDataSize); err != nil {
 		return err
 	}
@@ -61,6 +66,9 @@ func ValidateServerConfig(c *ServerConfig) error {
 // ResolveClientPassword returns the configured authentication secret.
 // A client outbound accepts exactly one user, or the legacy password field.
 func ResolveClientPassword(c *ClientConfig) (string, error) {
+	if err := validateTransport(c.Transport, c.Compression); err != nil {
+		return "", err
+	}
 	if err := ValidateSettings(c.MaxFrameSize, c.MaxDataSize); err != nil {
 		return "", err
 	}
@@ -80,6 +88,19 @@ func ResolveClientPassword(c *ClientConfig) (string, error) {
 		return c.Users[0].Auth, nil
 	}
 	return c.Password, nil
+}
+
+// Empty transport selects the Redis-style carrier; tcp keeps the original wire format.
+func useRedisTransport(name string) bool { return name == "" || name == "redis" }
+
+func validateTransport(name string, compression bool) error {
+	if name != "" && name != "tcp" && name != "redis" {
+		return fmt.Errorf("shine: unsupported transport %q", name)
+	}
+	if compression && !useRedisTransport(name) {
+		return fmt.Errorf("shine: compression requires redis transport")
+	}
+	return nil
 }
 
 // ValidateSettings checks the protocol frame limits used by both config and handlers.
@@ -104,7 +125,32 @@ func init() {
 		if e := ValidateServerConfig(c); e != nil {
 			return nil, e
 		}
-		return &Inbound{config: c}, nil
+		in := &Inbound{config: c}
+		if useRedisTransport(c.Transport) {
+			var secrets []string
+			if c.Password != "" {
+				secrets = append(secrets, c.Password)
+			}
+			for _, user := range c.Users {
+				secrets = append(secrets, user.Auth)
+			}
+			var authenticate func(string) bool
+			if len(secrets) > 0 {
+				authenticate = func(password string) bool {
+					matched := 0
+					for _, secret := range secrets {
+						matched |= subtle.ConstantTimeCompare([]byte(password), []byte(secret))
+					}
+					return matched == 1
+				}
+			}
+			var err error
+			in.carrier, err = rediswire.NewAcceptor(rediswire.Options{Compression: c.Compression}, len(secrets) > 0, authenticate)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return in, nil
 	}))
 	common.Must(common.RegisterConfig((*ClientConfig)(nil), func(_ context.Context, v interface{}) (interface{}, error) {
 		c := v.(*ClientConfig)
@@ -121,14 +167,36 @@ var _ proxy.Inbound = (*Inbound)(nil)
 var _ proxy.Outbound = (*Outbound)(nil)
 
 // Inbound accepts a Shine link and dispatches each multiplexed session to Xray.
-type Inbound struct{ config *ServerConfig }
+type Inbound struct {
+	config  *ServerConfig
+	carrier *rediswire.Acceptor
+}
+
+// Close releases pending and active Redis transport connections.
+func (h *Inbound) Close() error {
+	if h.carrier != nil {
+		return h.carrier.Close()
+	}
+	return nil
+}
 
 func (*Inbound) Network() []xnet.Network { return []xnet.Network{xnet.Network_TCP} }
 func (h *Inbound) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	if network != xnet.Network_TCP {
 		return fmt.Errorf("shine: unsupported transport network %v", network)
 	}
-	link, err := shine.Server(ctx, conn, h.config.opts())
+	var stream io.ReadWriteCloser = conn
+	if h.carrier != nil {
+		var err error
+		stream, err = h.carrier.AcceptConn(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if stream == nil {
+			return nil
+		}
+	}
+	link, err := shine.Server(ctx, stream, h.config.opts())
 	if err != nil {
 		return err
 	}
@@ -278,7 +346,15 @@ func (h *Outbound) getLink(ctx context.Context, dialer internet.Dialer) (*shine.
 		dialCtx, cancel := context.WithCancel(ctx)
 		stop := context.AfterFunc(h.done, cancel)
 		dest := xnet.TCPDestination(xnet.ParseAddress(h.config.Address), xnet.Port(h.config.Port))
-		conn, err := dialer.Dial(dialCtx, dest)
+		var conn io.ReadWriteCloser
+		var err error
+		if useRedisTransport(h.config.Transport) {
+			conn, err = rediswire.Client(dialCtx, func(ctx context.Context) (io.ReadWriteCloser, error) {
+				return dialer.Dial(ctx, dest)
+			}, rediswire.Options{Password: h.password, Compression: h.config.Compression})
+		} else {
+			conn, err = dialer.Dial(dialCtx, dest)
+		}
 		var l *shine.Link
 		if err == nil {
 			l, err = shine.Client(dialCtx, conn, h.config.opts(h.password))
