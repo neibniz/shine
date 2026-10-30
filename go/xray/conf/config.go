@@ -47,8 +47,14 @@ type Options struct {
 	HandshakeTimeoutSeconds uint32 `json:"handshakeTimeoutSeconds"`
 	PingIntervalSeconds     uint32 `json:"pingIntervalSeconds"`
 	PongTimeoutSeconds      uint32 `json:"pongTimeoutSeconds"`
+	MaxSessions             uint32 `json:"maxSessions"`
+	DatagramQueueBytes      uint32 `json:"datagramQueueBytes"`
 }
-type InboundConfig struct{ Options }
+type InboundConfig struct {
+	Options
+	MaxTotalSessions             uint32 `json:"maxTotalSessions"`
+	UDPFirstPacketTimeoutSeconds uint32 `json:"udpFirstPacketTimeoutSeconds"`
+}
 type OutboundConfig struct {
 	Options
 	Address string `json:"address"`
@@ -81,7 +87,7 @@ func (o Options) userConfigs() []*adapter.User {
 }
 func (c *InboundConfig) Build() (proto.Message, error) {
 	o := c.Options
-	config := &adapter.ServerConfig{Password: o.Password, Users: o.userConfigs(), InitialWindow: o.InitialWindow, MaxFrameSize: o.MaxFrameSize, MaxDataSize: o.MaxDataSize, HandshakeTimeoutSeconds: o.HandshakeTimeoutSeconds, PingIntervalSeconds: o.PingIntervalSeconds, PongTimeoutSeconds: o.PongTimeoutSeconds, Transport: o.Transport, Compression: o.Compression}
+	config := &adapter.ServerConfig{Password: o.Password, Users: o.userConfigs(), InitialWindow: o.InitialWindow, MaxFrameSize: o.MaxFrameSize, MaxDataSize: o.MaxDataSize, HandshakeTimeoutSeconds: o.HandshakeTimeoutSeconds, PingIntervalSeconds: o.PingIntervalSeconds, PongTimeoutSeconds: o.PongTimeoutSeconds, Transport: o.Transport, Compression: o.Compression, MaxSessions: o.MaxSessions, MaxTotalSessions: c.MaxTotalSessions, DatagramQueueBytes: o.DatagramQueueBytes, UdpFirstPacketTimeoutSeconds: c.UDPFirstPacketTimeoutSeconds}
 	if err := adapter.ValidateServerConfig(config); err != nil {
 		return nil, err
 	}
@@ -89,7 +95,7 @@ func (c *InboundConfig) Build() (proto.Message, error) {
 }
 func (c *OutboundConfig) Build() (proto.Message, error) {
 	o := c.Options
-	config := &adapter.ClientConfig{Address: c.Address, Port: c.Port, Password: o.Password, Users: o.userConfigs(), InitialWindow: o.InitialWindow, MaxFrameSize: o.MaxFrameSize, MaxDataSize: o.MaxDataSize, HandshakeTimeoutSeconds: o.HandshakeTimeoutSeconds, PingIntervalSeconds: o.PingIntervalSeconds, PongTimeoutSeconds: o.PongTimeoutSeconds, Transport: o.Transport, Compression: o.Compression}
+	config := &adapter.ClientConfig{Address: c.Address, Port: c.Port, Password: o.Password, Users: o.userConfigs(), InitialWindow: o.InitialWindow, MaxFrameSize: o.MaxFrameSize, MaxDataSize: o.MaxDataSize, HandshakeTimeoutSeconds: o.HandshakeTimeoutSeconds, PingIntervalSeconds: o.PingIntervalSeconds, PongTimeoutSeconds: o.PongTimeoutSeconds, Transport: o.Transport, Compression: o.Compression, MaxSessions: o.MaxSessions, DatagramQueueBytes: o.DatagramQueueBytes}
 	if _, err := adapter.ResolveClientPassword(config); err != nil {
 		return nil, err
 	}

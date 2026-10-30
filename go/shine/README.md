@@ -106,27 +106,41 @@ default when its `transport` setting is omitted.
 - Session implements `io.Reader`, `io.Writer` and `io.Closer`, plus `CloseWrite`.
   It does not implement `net.Conn`. TCP reads/writes are serialized per direction;
   they may run concurrently with each other. `ReadContext` and `WriteContext`
-  cancel a wait for data or credit without closing the session. Concurrent calls
-  in the same direction wait for the preceding call to release its lock before
-  they can observe cancellation.
+  cancel waits for data, credit, the send queue, or another operation in the
+  same direction without closing the session. If a read has already consumed
+  bytes when its window update is canceled, it returns those bytes with the
+  context error; the next read retries the pending update.
 - A successful write means the frame was queued, not that the peer received it.
   Keep the link open while sessions are in use. `Link.Close` immediately closes
   the transport, aborts sessions and may discard queued frames. `Link.Done` and
   `Link.Err` report termination. `Session.Close` releases a session, whereas
   `CloseWrite` supports TCP half-close and keeps the read side available.
-- `AcceptQueue` is bounded; a new session is reset if it cannot be queued.
-  TCP data is buffered up to `InitialWindow` per session, and a peer exceeding
-  that limit has its session reset. `DatagramQueue` bounds queued UDP packets.
-  Callers should also impose connection/session limits appropriate for their use.
+- `MaxSessions` bounds active TCP and UDP sessions per link (default 256). A
+  local `Open` at capacity returns `ErrSessionLimit`; an excess peer-created
+  session is reset without closing the link. `AcceptQueue` also bounds sessions
+  awaiting acceptance. To share a total limit across links, create a
+  `SessionLimiter` with `NewSessionLimiter` and pass the same pointer in each
+  link's options. Links and sessions release their slots when closed.
+- TCP data is buffered up to `InitialWindow` per session; a peer exceeding it
+  has its session reset. UDP receive queues allocate on demand and are bounded
+  by both `DatagramQueue` (default 1,024 packets) and `DatagramQueueBytes`
+  (default 256 KiB, including the payload, address and 64 bytes per packet).
+  Packets exceeding either bound are dropped. These are per-session limits;
+  embedders must also limit the number of physical connections.
 - `Open` sends NEW and returns without waiting for ACK, matching the existing C++
   implementation. It does not confirm the target was successfully connected.
 - Set the same `InitialWindow` on both ends when interoperating with the C++
   implementation: its ACK does not advertise the receiving peer's window.
 - Defaults match C++: 256 KiB window and DATA payload, 512 MiB maximum RESP
   bulk, 5 second handshake timeout, 15 second ping and 10 second pong timeout.
-  `MaxFrameSize` additionally limits the **sum** of array contents. Lower it
-  for deployments that do not require large frames; a malicious peer can cause
-  an allocation up to that limit. It must be at least `MaxDataSize + 9`.
+  `MaxFrameSize` additionally limits the **sum** of array contents and must be
+  at least `MaxDataSize + 9`. Frame bodies are allocated incrementally as data
+  arrives. Before authentication, handshake frames are limited to 64 KiB, or
+  the configured authentication secret's size if larger, up to `MaxFrameSize`.
+  Authenticated peers can still send bodies up to `MaxFrameSize`, so lower it
+  for deployments that do not need large frames. `PongTimeout` includes time
+  waiting to queue the heartbeat; a stalled send queue therefore terminates
+  the link instead of leaving operations such as `Close` blocked indefinitely.
 - Authentication sends a password over the transport; it does not encrypt or
   authenticate the transport itself. Use a secure transport such as TLS when
   confidentiality and peer authentication are required.
@@ -145,6 +159,4 @@ SHINE_CPP_BIN=/absolute/path/to/shine go test -race ./...
 The integration tests start the supplied binary with temporary configuration and
 exercise Go client → C++ server TCP/UDP and C++ client → Go server TCP/UDP. The
 binary should be built from the intended C++ revision before relying on the
-result. The C++ SOCKS5 UDP inbound currently emits a nonstandard IPv4 response
-header; the integration test records that existing behavior while checking the
-Shine datagram itself. The tests use local sockets and are skipped if `SHINE_CPP_BIN` is unset.
+result. The tests use local sockets and are skipped if `SHINE_CPP_BIN` is unset.

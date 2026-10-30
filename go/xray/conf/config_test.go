@@ -108,3 +108,43 @@ func TestCredentialConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestResourceLimitsConfiguration(t *testing.T) {
+	var inbound InboundConfig
+	if err := json.Unmarshal([]byte(`{"maxSessions":3,"maxTotalSessions":5,"datagramQueueBytes":65536,"udpFirstPacketTimeoutSeconds":2}`), &inbound); err != nil {
+		t.Fatal(err)
+	}
+	m, err := inbound.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := serial.ToTypedMessage(m).GetInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := decoded.(*adapter.ServerConfig)
+	if cfg.MaxSessions != 3 || cfg.MaxTotalSessions != 5 || cfg.DatagramQueueBytes != 65536 || cfg.UdpFirstPacketTimeoutSeconds != 2 {
+		t.Fatalf("unexpected limits: %+v", cfg)
+	}
+	var outbound OutboundConfig
+	if err = json.Unmarshal([]byte(`{"address":"example.com","port":443,"maxSessions":4,"datagramQueueBytes":131072}`), &outbound); err != nil {
+		t.Fatal(err)
+	}
+	m, err = outbound.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := m.(*adapter.ClientConfig)
+	if client.MaxSessions != 4 || client.DatagramQueueBytes != 131072 {
+		t.Fatalf("unexpected limits: %+v", client)
+	}
+	for _, input := range []string{`{"maxSessions":1048577}`, `{"maxTotalSessions":1048577}`, `{"datagramQueueBytes":67108865}`} {
+		var c InboundConfig
+		if err = json.Unmarshal([]byte(input), &c); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = c.Build(); err == nil {
+			t.Fatalf("accepted oversized limit: %s", input)
+		}
+	}
+}

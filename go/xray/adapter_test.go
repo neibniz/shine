@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -195,5 +196,80 @@ func TestDefaultTransport(t *testing.T) {
 				t.Fatalf("transport %q carrier=%v", tc.transport, in.carrier != nil)
 			}
 		})
+	}
+}
+
+func TestInboundSharedLimitAndIdleUDPTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	obj, err := common.CreateObject(ctx, &ServerConfig{Transport: "tcp", MaxSessions: 3, MaxTotalSessions: 1, UdpFirstPacketTimeoutSeconds: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbound := obj.(*Inbound)
+	defer inbound.Close()
+	// Occupy the inbound-wide limit using another server link.
+	c1, s1 := net.Pipe()
+	ready := make(chan *shine.Link, 1)
+	go func() {
+		l, e := shine.Server(ctx, s1, shine.Options{SessionLimiter: inbound.limiter})
+		if e == nil {
+			ready <- l
+		}
+	}()
+	client1, err := shine.Client(ctx, c1, shine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client1.Close()
+	server1 := <-ready
+	defer server1.Close()
+	if _, err = client1.OpenUDP(ctx); err != nil {
+		t.Fatal(err)
+	}
+	occupied, err := server1.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, s2 := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- inbound.Process(ctx, xnet.Network_TCP, s2, nil) }()
+	client2, err := shine.Client(ctx, c2, shine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client2.Close()
+	excess, err := client2.OpenUDP(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = excess.ReceiveDatagram(ctx); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shared limit did not reset excess session: %v", err)
+	}
+	if err = occupied.Close(); err != nil {
+		t.Fatal(err)
+	}
+	idle, err := client2.OpenUDP(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	if _, err = idle.ReceiveDatagram(ctx); !errors.Is(err, io.EOF) {
+		t.Fatalf("idle session did not close on timeout: %v", err)
+	}
+	// The timeout must free its reservation so a new session can be opened.
+	next, err := client2.OpenUDP(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	if _, err = next.ReceiveDatagram(ctx); !errors.Is(err, io.EOF) {
+		t.Fatalf("slot not reusable after timeout: %v", err)
+	}
+	client2.Close()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("inbound did not stop")
 	}
 }

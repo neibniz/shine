@@ -25,6 +25,10 @@ message ServerConfig {
   repeated User users = 9;
   string transport = 10; // Empty defaults to redis; tcp selects the legacy protocol.
   bool compression = 11;
+  uint32 max_sessions = 12; // Maximum active TCP and UDP sessions per link.
+  uint32 max_total_sessions = 13; // Maximum sessions across this inbound.
+  uint32 datagram_queue_bytes = 14; // Accounted receive-queue bytes per UDP session.
+  uint32 udp_first_packet_timeout_seconds = 15;
 }
 message ClientConfig {
   string address = 1;
@@ -39,4 +43,6 @@ message ClientConfig {
   repeated User users = 11;
   string transport = 12; // Empty defaults to redis; tcp selects the legacy protocol.
   bool compression = 13;
+  uint32 max_sessions = 14;
+  uint32 datagram_queue_bytes = 15;
 }

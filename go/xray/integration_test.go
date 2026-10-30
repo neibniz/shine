@@ -171,6 +171,12 @@ func testXrayEndToEnd(t *testing.T, mode string) {
 	client := map[string]any{"log": map[string]any{"loglevel": "warning"}, "inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": clientPort, "protocol": "socks", "settings": map[string]any{"udp": true}}}, "outbounds": []any{map[string]any{"protocol": "shine", "settings": map[string]any{"address": "127.0.0.1", "port": serverPort, "users": clientUsers}}}}
 	serverSettings := server["inbounds"].([]any)[0].(map[string]any)["settings"].(map[string]any)
 	clientSettings := client["outbounds"].([]any)[0].(map[string]any)["settings"].(map[string]any)
+	serverSettings["maxSessions"] = 64
+	serverSettings["maxTotalSessions"] = 128
+	serverSettings["datagramQueueBytes"] = 262144
+	serverSettings["udpFirstPacketTimeoutSeconds"] = 5
+	clientSettings["maxSessions"] = 32
+	clientSettings["datagramQueueBytes"] = 131072
 	redisMode := mode != "tcp"
 	if redisMode {
 		if mode != "redis-default-uncompressed" {

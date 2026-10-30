@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+
+	"github.com/hhhflow2020/shine/go/shine/internal/bounded"
 )
 
 const maxBulk = 512 << 20
@@ -75,14 +77,18 @@ func readBulk(r *bufio.Reader, limit int) ([]byte, error) {
 	if n > limit {
 		return nil, errors.New("shine: frame exceeds limit")
 	}
-	b := make([]byte, n+2)
-	if _, err = io.ReadFull(r, b); err != nil {
+	body, err := bounded.Read(r, n)
+	if err != nil {
 		return nil, err
 	}
-	if b[n] != '\r' || b[n+1] != '\n' {
+	var terminator [2]byte
+	if _, err = io.ReadFull(r, terminator[:]); err != nil {
+		return nil, err
+	}
+	if terminator != [2]byte{'\r', '\n'} {
 		return nil, errors.New("shine: invalid bulk terminator")
 	}
-	return b[:n], nil
+	return body, nil
 }
 func readFrame(r *bufio.Reader, limit int) (frame, error) {
 	t, err := r.ReadByte()

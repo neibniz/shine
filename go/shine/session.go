@@ -17,27 +17,74 @@ type Datagram struct {
 // Read and Write are safe concurrently. Read calls and Write calls are each
 // serialized. Use CloseWrite to send EOF while continuing to read.
 type Session struct {
-	link                      *Link
-	id                        uint64
-	target                    Address
-	udp                       bool
-	readMu, writeMu           sync.Mutex
-	mu                        sync.Mutex
-	notify                    chan struct{}
-	buf                       []byte
-	credit                    uint64
-	consumed                  uint32
-	localClosed, remoteClosed bool
-	err                       error
-	datagrams                 chan Datagram
+	link                        *Link
+	id                          uint64
+	target                      Address
+	udp                         bool
+	readGate, writeGate         chan struct{}
+	mu                          sync.Mutex
+	notify                      chan struct{}
+	closed, writeClosed         chan struct{}
+	buf                         []byte
+	credit                      uint64
+	consumed                    uint64
+	localClosed, remoteClosed   bool
+	err                         error
+	datagrams                   []Datagram
+	datagramHead, datagramBytes int
 }
 
 func newSession(l *Link, id uint64, a Address, udp bool, credit uint32) *Session {
-	s := &Session{link: l, id: id, target: a, udp: udp, notify: make(chan struct{}), credit: uint64(credit)}
-	if udp {
-		s.datagrams = make(chan Datagram, l.opts.DatagramQueue)
-	}
+	s := &Session{link: l, id: id, target: a, udp: udp, notify: make(chan struct{}), closed: make(chan struct{}), writeClosed: make(chan struct{}), credit: uint64(credit), readGate: make(chan struct{}, 1), writeGate: make(chan struct{}, 1)}
+	s.readGate <- struct{}{}
+	s.writeGate <- struct{}{}
 	return s
+}
+
+// lockGate makes waiting for another operation cancellable as well as the I/O
+// itself. stop is closed when the relevant side of the session is closed.
+func lockGate(ctx context.Context, gate chan struct{}, stop <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Preserve buffered reads after a link failure when no other reader holds
+	// the gate. Only a caller that must wait needs the session-close signal.
+	select {
+	case <-gate:
+		if err := ctx.Err(); err != nil {
+			gate <- struct{}{}
+			return err
+		}
+		return nil
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-stop:
+		return io.ErrClosedPipe
+	case <-gate:
+		if err := ctx.Err(); err != nil {
+			gate <- struct{}{}
+			return err
+		}
+		return nil
+	}
+}
+
+func unlockGate(gate chan struct{}) { gate <- struct{}{} }
+
+// Preserve a reset or link failure as the cause when closing a gate wakes an
+// operation. A locally half-closed write side still reports ErrClosedPipe.
+func (s *Session) gateError(err error) error {
+	if errors.Is(err, io.ErrClosedPipe) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.err != nil {
+			return s.err
+		}
+	}
+	return err
 }
 
 // ID is the session identifier on this link.
@@ -53,8 +100,14 @@ func (s *Session) abort(err error) {
 	s.mu.Lock()
 	if s.err == nil {
 		s.err = err
-		s.localClosed = true
+		if !s.localClosed {
+			s.localClosed = true
+			close(s.writeClosed)
+		}
 		s.remoteClosed = true
+		close(s.closed)
+		s.datagrams = nil
+		s.datagramHead, s.datagramBytes = 0, 0
 		s.wake()
 	}
 	s.mu.Unlock()
@@ -89,12 +142,55 @@ func (s *Session) deliverDatagram(d Datagram) {
 	if s.err != nil || s.remoteClosed {
 		return
 	}
-	select {
-	case s.datagrams <- d:
-		s.wake()
-	default:
+	// Include per-packet overhead so empty packets are bounded as well.
+	cost := len(d.Data) + len(d.Target.Host) + 64
+	if len(s.datagrams)-s.datagramHead >= s.link.opts.DatagramQueue || cost > s.link.opts.DatagramQueueBytes-s.datagramBytes {
+		return
 	}
+	if s.datagramHead > 0 && len(s.datagrams) == cap(s.datagrams) {
+		count := copy(s.datagrams, s.datagrams[s.datagramHead:])
+		clear(s.datagrams[count:])
+		s.datagrams = s.datagrams[:count]
+		s.datagramHead = 0
+	}
+	s.datagrams = append(s.datagrams, d)
+	s.datagramBytes += cost
+	s.wake()
 } // UDP is lossy under pressure
+
+// flushWindow preserves credit when cancellation interrupts a blocked enqueue.
+// The next read retries it before waiting for more data.
+func (s *Session) flushWindow(ctx context.Context) error {
+	s.mu.Lock()
+	if s.err != nil {
+		// No further credit is useful after a hard close; buffered TCP data can
+		// still be delivered before reporting the close reason to the reader.
+		s.mu.Unlock()
+		return nil
+	}
+	threshold := uint64(s.link.opts.InitialWindow / 2)
+	if threshold == 0 {
+		threshold = 1
+	}
+	if s.consumed < threshold {
+		s.mu.Unlock()
+		return nil
+	}
+	delta := s.consumed
+	if delta > uint64(^uint32(0)) {
+		delta = uint64(^uint32(0))
+	}
+	s.consumed -= delta
+	s.mu.Unlock()
+	if err := s.link.enqueueWithStop(ctx, control("WINDOW", u64(s.id), u32(uint32(delta))), s.closed); err != nil {
+		s.mu.Lock()
+		s.consumed += delta
+		s.mu.Unlock()
+		return s.gateError(err)
+	}
+	return nil
+}
+
 // Read reads TCP bytes, returning EOF after the peer closes its write side.
 func (s *Session) Read(p []byte) (int, error) { return s.ReadContext(context.Background(), p) }
 
@@ -106,8 +202,13 @@ func (s *Session) ReadContext(ctx context.Context, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
+	if err := lockGate(ctx, s.readGate, s.closed); err != nil {
+		return 0, s.gateError(err)
+	}
+	defer unlockGate(s.readGate)
+	if err := s.flushWindow(ctx); err != nil {
+		return 0, err
+	}
 	for {
 		s.mu.Lock()
 		if len(s.buf) > 0 {
@@ -116,21 +217,10 @@ func (s *Session) ReadContext(ctx context.Context, p []byte) (int, error) {
 			if len(s.buf) == 0 {
 				s.buf = nil
 			}
-			s.consumed += uint32(n)
-			delta := uint32(0)
-			threshold := s.link.opts.InitialWindow / 2
-			if threshold == 0 {
-				threshold = 1
-			}
-			if s.consumed >= threshold {
-				delta = s.consumed
-				s.consumed = 0
-			}
+			s.consumed += uint64(n)
 			s.mu.Unlock()
-			if delta > 0 {
-				if err := s.link.enqueue(context.Background(), control("WINDOW", u64(s.id), u32(delta))); err != nil {
-					return n, err
-				}
+			if err := s.flushWindow(ctx); err != nil {
+				return n, err
 			}
 			return n, nil
 		}
@@ -163,8 +253,10 @@ func (s *Session) WriteContext(ctx context.Context, p []byte) (int, error) {
 	if s.udp {
 		return 0, errors.New("shine: Write on UDP session")
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	if err := lockGate(ctx, s.writeGate, s.writeClosed); err != nil {
+		return 0, s.gateError(err)
+	}
+	defer unlockGate(s.writeGate)
 	written := 0
 	for len(p) > 0 {
 		s.mu.Lock()
@@ -198,11 +290,11 @@ func (s *Session) WriteContext(ctx context.Context, p []byte) (int, error) {
 		}
 		s.credit -= uint64(n)
 		s.mu.Unlock()
-		if err := s.link.enqueue(ctx, dataFrame(s.id, p[:n])); err != nil {
+		if err := s.link.enqueueWithStop(ctx, dataFrame(s.id, p[:n]), s.writeClosed); err != nil {
 			s.mu.Lock()
 			s.credit += uint64(n)
 			s.mu.Unlock()
-			return written, err
+			return written, s.gateError(err)
 		}
 		written += n
 		p = p[n:]
@@ -218,12 +310,13 @@ func (s *Session) CloseWrite() error {
 		return nil
 	}
 	s.localClosed = true
+	close(s.writeClosed)
 	s.wake()
 	both := s.remoteClosed
 	s.mu.Unlock()
 	// A pending writer must finish (or observe localClosed) before CLOSE is sent.
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	_ = lockGate(context.Background(), s.writeGate, nil)
+	defer unlockGate(s.writeGate)
 	err := s.link.enqueue(context.Background(), control("CLOSE", u64(s.id), nil))
 	if both {
 		s.link.remove(s.id, s)
@@ -240,13 +333,20 @@ func (s *Session) Close() error {
 	}
 	send := !s.localClosed
 	s.err = io.ErrClosedPipe
-	s.localClosed, s.remoteClosed = true, true
+	if !s.localClosed {
+		s.localClosed = true
+		close(s.writeClosed)
+	}
+	s.remoteClosed = true
+	close(s.closed)
+	s.datagrams = nil
+	s.datagramHead, s.datagramBytes = 0, 0
 	s.wake()
 	s.mu.Unlock()
 	s.link.remove(s.id, s)
 	if send {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
+		_ = lockGate(context.Background(), s.writeGate, nil)
+		defer unlockGate(s.writeGate)
 		return s.link.enqueue(context.Background(), control("CLOSE", u64(s.id), nil))
 	}
 	return nil
@@ -264,8 +364,10 @@ func (s *Session) SendDatagram(ctx context.Context, data []byte, target Address)
 	if len(data) > 65535 || len(data)+len(addr)+len("UDP_DATA")+8 > s.link.opts.MaxFrameSize {
 		return errors.New("shine: datagram exceeds frame limit")
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	if err := lockGate(ctx, s.writeGate, s.writeClosed); err != nil {
+		return s.gateError(err)
+	}
+	defer unlockGate(s.writeGate)
 	s.mu.Lock()
 	closed := s.localClosed
 	err = s.err
@@ -276,7 +378,7 @@ func (s *Session) SendDatagram(ctx context.Context, data []byte, target Address)
 	if closed {
 		return io.ErrClosedPipe
 	}
-	return s.link.enqueue(ctx, control("UDP_DATA", u64(s.id), addr, data))
+	return s.gateError(s.link.enqueueWithStop(ctx, control("UDP_DATA", u64(s.id), addr, data), s.writeClosed))
 }
 
 // ReceiveDatagram receives one UDP datagram. A full receive queue drops packets.
@@ -284,15 +386,23 @@ func (s *Session) ReceiveDatagram(ctx context.Context) (Datagram, error) {
 	if !s.udp {
 		return Datagram{}, errors.New("shine: datagram on TCP session")
 	}
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
+	if err := lockGate(ctx, s.readGate, s.closed); err != nil {
+		return Datagram{}, s.gateError(err)
+	}
+	defer unlockGate(s.readGate)
 	for {
 		s.mu.Lock()
-		select {
-		case d := <-s.datagrams:
+		if s.datagramHead < len(s.datagrams) {
+			d := s.datagrams[s.datagramHead]
+			s.datagrams[s.datagramHead] = Datagram{}
+			s.datagramHead++
+			s.datagramBytes -= len(d.Data) + len(d.Target.Host) + 64
+			if s.datagramHead == len(s.datagrams) {
+				s.datagrams = s.datagrams[:0]
+				s.datagramHead = 0
+			}
 			s.mu.Unlock()
 			return d, nil
-		default:
 		}
 		if s.err != nil {
 			err := s.err

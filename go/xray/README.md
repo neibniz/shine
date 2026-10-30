@@ -36,7 +36,7 @@ GOWORK=off go build -mod=mod -o xray ./main
 
 工作流 [Build Xray with Shine](../../.github/workflows/xray-shine.yml) 可在 Actions 页面通过 **Run workflow** 手动启动，在 `xray_ref` 中填写 Xray-core 的标签、分支或提交，例如 `v26.10.29`。工作流会先将所选引用解析为一个固定提交，所有测试、交叉编译和镜像都使用这个提交。默认的 `v26.10.29` 和较早的 `v26.9.9` 已在本地完成集成测试。推送到 `main`、`master` 或 `v*` 标签以及向主分支提交 pull request 时，也会使用默认版本自动构建。
 
-构建前会把本仓库的 Shine 适配层和注册补丁合并进临时检出，运行协议库和适配层测试以及真实 Xray 双端测试。补丁不适用、接口不兼容或测试不通过时，该次构建会失败，不会发布镜像。选择版本不代表该版本一定兼容。
+构建前会把本仓库的 Shine 适配层和注册补丁合并进临时检出，构建 C++ Shine，并运行协议库和适配层的竞态检测、真实 Xray 双端测试以及与 C++ 对端的互通测试。补丁不适用、接口不兼容或测试不通过时，该次构建会失败，不会发布镜像。选择版本不代表该版本一定兼容。
 
 构建完成后，从工作流的 Artifacts 下载 Linux（amd64、arm64、armv7、386）、macOS（amd64、arm64）和 Windows（amd64、arm64）的归档，以及 `SHA256SUMS-xray-shine.txt`。每个归档包含程序、双方许可证和记录两个项目提交的 `BUILD-INFO.txt`。推送本仓库的 `v*` 标签时，这些文件也会附加到相应 GitHub Release。
 
@@ -131,8 +131,14 @@ docker run --rm -p 7011:7011 \
 | `handshakeTimeoutSeconds` | 秒 | 5 |
 | `pingIntervalSeconds` | 秒 | 15 |
 | `pongTimeoutSeconds` | 秒 | 10 |
+| `maxSessions` | 每条连接的 TCP/UDP 会话数 | 256 |
+| `datagramQueueBytes` | 每个 UDP 会话接收队列的计费字节数 | 262144 |
+| `maxTotalSessions` | 每个 Shine 入站的会话总数 | 1024 |
+| `udpFirstPacketTimeoutSeconds` | Shine 入站等待 UDP 首包的秒数 | 30 |
 
 `maxFrameSize` 至少为 `maxDataSize + 9`，并且不能大于 512 MiB。与当前 C++ 实现互通时，两端的 `initialWindow` 必须一致。可以调低帧上限，限制对端单帧触发的内存分配。
+
+`maxSessions` 和 `datagramQueueBytes` 在入站、出站均可设置；`maxTotalSessions` 和 `udpFirstPacketTimeoutSeconds` 仅用于入站。`maxSessions`、`maxTotalSessions` 最大为 1048576，`datagramQueueBytes` 最大为 67108864。UDP 队列还按每包地址及固定开销计费；队列达到数量或字节上限后会丢包。入站的总量限制由该入站的多条 Shine 连接共享，但不限制物理连接数。入站等待 UDP 首包超时后释放该会话；客户端需要重新打开会话。若调用端超过单链路会话上限，打开会话会失败；超过服务端限制的会话会收到 RESET。
 
 UDP 会话按首个数据报的目标交给 Xray 路由；后续数据报保留各自的目标地址，但沿用该会话已选择的路由。Xray 的缓冲通道会忽略空 UDP 数据报。Xray 出口通过其 dialer 建立 Shine 连接，因此 Xray 的出口传输设置由 Xray 处理。Shine 自带复用，额外启用 Xray mux 会叠加一层复用，应先评估是否需要。
 
@@ -166,6 +172,8 @@ cd /path/to/shine/go/xray
 go test -race ./...
 # 用按上面方法构建的 Xray 验证真实双端配置、并发复用和 TCP/UDP：
 SHINE_XRAY_BIN=/absolute/path/to/xray go test -race ./...
+# 同时验证 Xray 与 C++ 对端的互通：
+SHINE_XRAY_BIN=/absolute/path/to/xray SHINE_CPP_BIN=/absolute/path/to/shine go test -race ./...
 ```
 
-端到端测试启动两个 Xray 进程和本地回显服务；没有 `SHINE_XRAY_BIN` 时自动跳过。仓库内的协议库和适配层尚未发布，因此独立引用时需使用本地 `replace`，或发布后改为对应的模块版本。
+端到端测试启动 Xray 和本地回显服务；没有 `SHINE_XRAY_BIN` 时自动跳过。与 C++ 对端的测试还需要设置 `SHINE_CPP_BIN`。仓库内的协议库和适配层尚未作为 Go 模块发布，因此独立引用时需使用本地 `replace`，或发布后改为对应的模块版本。

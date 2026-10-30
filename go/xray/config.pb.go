@@ -135,19 +135,23 @@ func (x *UserIdentity) GetLevel() uint32 {
 }
 
 type ServerConfig struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	Password                string                 `protobuf:"bytes,1,opt,name=password,proto3" json:"password,omitempty"` // Legacy single-password configuration.
-	InitialWindow           uint32                 `protobuf:"varint,2,opt,name=initial_window,json=initialWindow,proto3" json:"initial_window,omitempty"`
-	MaxFrameSize            uint32                 `protobuf:"varint,3,opt,name=max_frame_size,json=maxFrameSize,proto3" json:"max_frame_size,omitempty"`
-	MaxDataSize             uint32                 `protobuf:"varint,4,opt,name=max_data_size,json=maxDataSize,proto3" json:"max_data_size,omitempty"`
-	HandshakeTimeoutSeconds uint32                 `protobuf:"varint,5,opt,name=handshake_timeout_seconds,json=handshakeTimeoutSeconds,proto3" json:"handshake_timeout_seconds,omitempty"`
-	PingIntervalSeconds     uint32                 `protobuf:"varint,6,opt,name=ping_interval_seconds,json=pingIntervalSeconds,proto3" json:"ping_interval_seconds,omitempty"`
-	PongTimeoutSeconds      uint32                 `protobuf:"varint,7,opt,name=pong_timeout_seconds,json=pongTimeoutSeconds,proto3" json:"pong_timeout_seconds,omitempty"`
-	Users                   []*User                `protobuf:"bytes,9,rep,name=users,proto3" json:"users,omitempty"`
-	Transport               string                 `protobuf:"bytes,10,opt,name=transport,proto3" json:"transport,omitempty"` // Empty defaults to redis; tcp selects the legacy protocol.
-	Compression             bool                   `protobuf:"varint,11,opt,name=compression,proto3" json:"compression,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                        protoimpl.MessageState `protogen:"open.v1"`
+	Password                     string                 `protobuf:"bytes,1,opt,name=password,proto3" json:"password,omitempty"` // Legacy single-password configuration.
+	InitialWindow                uint32                 `protobuf:"varint,2,opt,name=initial_window,json=initialWindow,proto3" json:"initial_window,omitempty"`
+	MaxFrameSize                 uint32                 `protobuf:"varint,3,opt,name=max_frame_size,json=maxFrameSize,proto3" json:"max_frame_size,omitempty"`
+	MaxDataSize                  uint32                 `protobuf:"varint,4,opt,name=max_data_size,json=maxDataSize,proto3" json:"max_data_size,omitempty"`
+	HandshakeTimeoutSeconds      uint32                 `protobuf:"varint,5,opt,name=handshake_timeout_seconds,json=handshakeTimeoutSeconds,proto3" json:"handshake_timeout_seconds,omitempty"`
+	PingIntervalSeconds          uint32                 `protobuf:"varint,6,opt,name=ping_interval_seconds,json=pingIntervalSeconds,proto3" json:"ping_interval_seconds,omitempty"`
+	PongTimeoutSeconds           uint32                 `protobuf:"varint,7,opt,name=pong_timeout_seconds,json=pongTimeoutSeconds,proto3" json:"pong_timeout_seconds,omitempty"`
+	Users                        []*User                `protobuf:"bytes,9,rep,name=users,proto3" json:"users,omitempty"`
+	Transport                    string                 `protobuf:"bytes,10,opt,name=transport,proto3" json:"transport,omitempty"` // Empty defaults to redis; tcp selects the legacy protocol.
+	Compression                  bool                   `protobuf:"varint,11,opt,name=compression,proto3" json:"compression,omitempty"`
+	MaxSessions                  uint32                 `protobuf:"varint,12,opt,name=max_sessions,json=maxSessions,proto3" json:"max_sessions,omitempty"`                        // Maximum active TCP and UDP sessions per link.
+	MaxTotalSessions             uint32                 `protobuf:"varint,13,opt,name=max_total_sessions,json=maxTotalSessions,proto3" json:"max_total_sessions,omitempty"`       // Maximum sessions across this inbound.
+	DatagramQueueBytes           uint32                 `protobuf:"varint,14,opt,name=datagram_queue_bytes,json=datagramQueueBytes,proto3" json:"datagram_queue_bytes,omitempty"` // Accounted receive-queue bytes per UDP session.
+	UdpFirstPacketTimeoutSeconds uint32                 `protobuf:"varint,15,opt,name=udp_first_packet_timeout_seconds,json=udpFirstPacketTimeoutSeconds,proto3" json:"udp_first_packet_timeout_seconds,omitempty"`
+	unknownFields                protoimpl.UnknownFields
+	sizeCache                    protoimpl.SizeCache
 }
 
 func (x *ServerConfig) Reset() {
@@ -250,6 +254,34 @@ func (x *ServerConfig) GetCompression() bool {
 	return false
 }
 
+func (x *ServerConfig) GetMaxSessions() uint32 {
+	if x != nil {
+		return x.MaxSessions
+	}
+	return 0
+}
+
+func (x *ServerConfig) GetMaxTotalSessions() uint32 {
+	if x != nil {
+		return x.MaxTotalSessions
+	}
+	return 0
+}
+
+func (x *ServerConfig) GetDatagramQueueBytes() uint32 {
+	if x != nil {
+		return x.DatagramQueueBytes
+	}
+	return 0
+}
+
+func (x *ServerConfig) GetUdpFirstPacketTimeoutSeconds() uint32 {
+	if x != nil {
+		return x.UdpFirstPacketTimeoutSeconds
+	}
+	return 0
+}
+
 type ClientConfig struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
 	Address                 string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
@@ -264,6 +296,8 @@ type ClientConfig struct {
 	Users                   []*User                `protobuf:"bytes,11,rep,name=users,proto3" json:"users,omitempty"`
 	Transport               string                 `protobuf:"bytes,12,opt,name=transport,proto3" json:"transport,omitempty"` // Empty defaults to redis; tcp selects the legacy protocol.
 	Compression             bool                   `protobuf:"varint,13,opt,name=compression,proto3" json:"compression,omitempty"`
+	MaxSessions             uint32                 `protobuf:"varint,14,opt,name=max_sessions,json=maxSessions,proto3" json:"max_sessions,omitempty"`
+	DatagramQueueBytes      uint32                 `protobuf:"varint,15,opt,name=datagram_queue_bytes,json=datagramQueueBytes,proto3" json:"datagram_queue_bytes,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -382,6 +416,20 @@ func (x *ClientConfig) GetCompression() bool {
 	return false
 }
 
+func (x *ClientConfig) GetMaxSessions() uint32 {
+	if x != nil {
+		return x.MaxSessions
+	}
+	return 0
+}
+
+func (x *ClientConfig) GetDatagramQueueBytes() uint32 {
+	if x != nil {
+		return x.DatagramQueueBytes
+	}
+	return 0
+}
+
 var File_config_proto protoreflect.FileDescriptor
 
 const file_config_proto_rawDesc = "" +
@@ -394,7 +442,7 @@ const file_config_proto_rawDesc = "" +
 	"\x05level\x18\x03 \x01(\rR\x05level\":\n" +
 	"\fUserIdentity\x12\x14\n" +
 	"\x05email\x18\x01 \x01(\tR\x05email\x12\x14\n" +
-	"\x05level\x18\x02 \x01(\rR\x05level\"\xa5\x03\n" +
+	"\x05level\x18\x02 \x01(\rR\x05level\"\xf0\x04\n" +
 	"\fServerConfig\x12\x1a\n" +
 	"\bpassword\x18\x01 \x01(\tR\bpassword\x12%\n" +
 	"\x0einitial_window\x18\x02 \x01(\rR\rinitialWindow\x12$\n" +
@@ -406,7 +454,11 @@ const file_config_proto_rawDesc = "" +
 	"\x05users\x18\t \x03(\v2\x10.shine.xray.UserR\x05users\x12\x1c\n" +
 	"\ttransport\x18\n" +
 	" \x01(\tR\ttransport\x12 \n" +
-	"\vcompression\x18\v \x01(\bR\vcompression\"\xd3\x03\n" +
+	"\vcompression\x18\v \x01(\bR\vcompression\x12!\n" +
+	"\fmax_sessions\x18\f \x01(\rR\vmaxSessions\x12,\n" +
+	"\x12max_total_sessions\x18\r \x01(\rR\x10maxTotalSessions\x120\n" +
+	"\x14datagram_queue_bytes\x18\x0e \x01(\rR\x12datagramQueueBytes\x12F\n" +
+	" udp_first_packet_timeout_seconds\x18\x0f \x01(\rR\x1cudpFirstPacketTimeoutSeconds\"\xa8\x04\n" +
 	"\fClientConfig\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x1a\n" +
@@ -419,7 +471,9 @@ const file_config_proto_rawDesc = "" +
 	"\x14pong_timeout_seconds\x18\t \x01(\rR\x12pongTimeoutSeconds\x12&\n" +
 	"\x05users\x18\v \x03(\v2\x10.shine.xray.UserR\x05users\x12\x1c\n" +
 	"\ttransport\x18\f \x01(\tR\ttransport\x12 \n" +
-	"\vcompression\x18\r \x01(\bR\vcompressionB+Z)github.com/hhhflow2020/shine/go/xray;xrayb\x06proto3"
+	"\vcompression\x18\r \x01(\bR\vcompression\x12!\n" +
+	"\fmax_sessions\x18\x0e \x01(\rR\vmaxSessions\x120\n" +
+	"\x14datagram_queue_bytes\x18\x0f \x01(\rR\x12datagramQueueBytesB+Z)github.com/hhhflow2020/shine/go/xray;xrayb\x06proto3"
 
 var (
 	file_config_proto_rawDescOnce sync.Once

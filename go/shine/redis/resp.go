@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+
+	"github.com/hhhflow2020/shine/go/shine/internal/bounded"
 )
 
 type value struct {
@@ -82,14 +84,18 @@ func readValueBudget(r *bufio.Reader, remaining *int, nodes *int, depth int) (va
 			return v, errors.New("redis transport: bulk length out of range")
 		}
 		*remaining -= int(n)
-		b := make([]byte, int(n)+2)
-		if _, e = io.ReadFull(r, b); e != nil {
+		b, e := bounded.Read(r, int(n))
+		if e != nil {
 			return v, e
 		}
-		if b[n] != '\r' || b[n+1] != '\n' {
+		var terminator [2]byte
+		if _, e = io.ReadFull(r, terminator[:]); e != nil {
+			return v, e
+		}
+		if terminator != [2]byte{'\r', '\n'} {
 			return v, errors.New("redis transport: invalid bulk terminator")
 		}
-		v.text = b[:n]
+		v.text = b
 		return v, nil
 	case '*':
 		n, e := number(r)

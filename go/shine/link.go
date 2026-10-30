@@ -36,16 +36,19 @@ type authEntry struct {
 // Options configures a link. Zero values use the protocol defaults.
 // Both peers must use the same InitialWindow when interoperating with the C++ implementation.
 type Options struct {
-	Password         string // client password, or a single server password
-	Users            []User // server-side password-to-identity mapping
-	InitialWindow    uint32
-	MaxFrameSize     int // maximum RESP bulk size and total array contents
-	MaxDataSize      int // maximum DATA payload emitted per frame
-	HandshakeTimeout time.Duration
-	PingInterval     time.Duration
-	PongTimeout      time.Duration
-	AcceptQueue      int
-	DatagramQueue    int
+	Password           string // client password, or a single server password
+	Users              []User // server-side password-to-identity mapping
+	InitialWindow      uint32
+	MaxFrameSize       int // maximum RESP bulk size and total array contents
+	MaxDataSize        int // maximum DATA payload emitted per frame
+	HandshakeTimeout   time.Duration
+	PingInterval       time.Duration
+	PongTimeout        time.Duration
+	AcceptQueue        int
+	DatagramQueue      int             // maximum queued packets per UDP session
+	DatagramQueueBytes int             // accounted payload and address bytes per UDP session
+	MaxSessions        int             // active TCP and UDP sessions per link
+	SessionLimiter     *SessionLimiter // optional limit shared across links
 }
 
 func (o Options) defaults() (Options, error) {
@@ -73,7 +76,13 @@ func (o Options) defaults() (Options, error) {
 	if o.DatagramQueue == 0 {
 		o.DatagramQueue = 1024
 	}
-	if o.MaxFrameSize < 64 || o.MaxFrameSize > maxBulk || o.MaxDataSize <= 0 || o.MaxDataSize > o.MaxFrameSize-9 || o.HandshakeTimeout < 0 || o.PingInterval < 0 || o.PongTimeout < 0 || o.AcceptQueue < 1 || o.DatagramQueue < 1 {
+	if o.DatagramQueueBytes == 0 {
+		o.DatagramQueueBytes = DefaultDatagramQueueBytes
+	}
+	if o.MaxSessions == 0 {
+		o.MaxSessions = DefaultMaxSessions
+	}
+	if o.MaxFrameSize < 64 || o.MaxFrameSize > maxBulk || o.MaxDataSize <= 0 || o.MaxDataSize > o.MaxFrameSize-9 || o.HandshakeTimeout < 0 || o.PingInterval < 0 || o.PongTimeout < 0 || o.AcceptQueue < 1 || o.DatagramQueue < 1 || o.DatagramQueueBytes < 1 || o.DatagramQueueBytes > maxDatagramQueueBytes || o.MaxSessions < 1 || o.MaxSessions > maxSessionLimit || (o.SessionLimiter != nil && o.SessionLimiter.limit == 0) {
 		return o, errors.New("shine: invalid options")
 	}
 	return o, nil
@@ -162,7 +171,20 @@ func writeAll(w io.Writer, b []byte) error {
 }
 func (l *Link) handshake() error {
 	read := func(want string) (frame, error) {
-		f, e := readFrame(l.reader, l.opts.MaxFrameSize)
+		// HELLO and authentication happen before the peer is trusted. Bound
+		// their total size without imposing a smaller limit on configured secrets.
+		limit := 64 << 10
+		if want == "AUTH" {
+			for _, entry := range l.authEntries {
+				if len(entry.password) > limit-len("AUTH") {
+					limit = len(entry.password) + len("AUTH")
+				}
+			}
+		}
+		if limit > l.opts.MaxFrameSize {
+			limit = l.opts.MaxFrameSize
+		}
+		f, e := readFrame(l.reader, limit)
 		if e != nil {
 			return f, e
 		}
@@ -282,6 +304,9 @@ func (l *Link) fail(err error) {
 		l.err = err
 		all := l.sessions
 		l.sessions = make(map[uint64]*Session)
+		if l.opts.SessionLimiter != nil {
+			l.opts.SessionLimiter.release(len(all))
+		}
 		close(l.done)
 		l.mu.Unlock()
 		l.conn.Close()
@@ -291,14 +316,26 @@ func (l *Link) fail(err error) {
 	})
 }
 func (l *Link) enqueue(ctx context.Context, b []byte) error {
+	return l.enqueueWithStop(ctx, b, nil)
+}
+
+// stop aborts a session-scoped enqueue without closing other sessions.
+func (l *Link) enqueueWithStop(ctx context.Context, b []byte, stop <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-l.done:
 		return l.Err()
+	case <-stop:
+		return io.ErrClosedPipe
 	default:
 	}
 	select {
 	case <-l.done:
 		return l.Err()
+	case <-stop:
+		return io.ErrClosedPipe
 	case <-ctx.Done():
 		return ctx.Err()
 	case l.send <- b:
@@ -336,22 +373,28 @@ func (l *Link) remove(id uint64, s *Session) {
 	l.mu.Lock()
 	if l.sessions[id] == s {
 		delete(l.sessions, id)
+		if l.opts.SessionLimiter != nil {
+			l.opts.SessionLimiter.release(1)
+		}
 	}
 	l.mu.Unlock()
 }
-func (l *Link) add(id uint64, s *Session) bool {
+func (l *Link) add(id uint64, s *Session) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	select {
 	case <-l.done:
-		return false
+		return l.err
 	default:
 	}
 	if _, ok := l.sessions[id]; ok {
-		return false
+		return errDuplicateSession
+	}
+	if len(l.sessions) >= l.opts.MaxSessions || (l.opts.SessionLimiter != nil && !l.opts.SessionLimiter.acquire()) {
+		return ErrSessionLimit
 	}
 	l.sessions[id] = s
-	return true
+	return nil
 }
 func randomID() (uint64, error) {
 	var b [8]byte
@@ -392,13 +435,11 @@ func (l *Link) open(ctx context.Context, a Address, udp bool) (*Session, error) 
 			return nil, e
 		}
 		s = newSession(l, id, a, udp, l.opts.InitialWindow)
-		if l.add(id, s) {
+		if err = l.add(id, s); err == nil {
 			break
 		}
-		select {
-		case <-l.done:
-			return nil, l.Err()
-		default:
+		if !errors.Is(err, errDuplicateSession) {
+			return nil, err
 		}
 	}
 	var wire []byte
@@ -462,8 +503,11 @@ func (l *Link) dispatch(f frame) error {
 			}
 		}
 		s := newSession(l, id, a, udp, win)
-		if !l.add(id, s) {
-			return errors.New("shine: duplicate session ID")
+		if err = l.add(id, s); err != nil {
+			if errors.Is(err, ErrSessionLimit) {
+				return l.enqueue(context.Background(), control("RESET", u64(id)))
+			}
+			return err
 		}
 		if err = l.enqueue(context.Background(), control("ACK", u64(id))); err != nil {
 			return err
@@ -557,26 +601,33 @@ func (l *Link) heartbeat() {
 				l.fail(err)
 				return
 			}
-			if err = l.enqueue(context.Background(), control("PING", u64(id))); err != nil {
+			// Include time spent waiting for space in the send queue. Otherwise a
+			// stalled transport can prevent the heartbeat timer from ever starting.
+			ctx, cancel := context.WithTimeout(context.Background(), l.opts.PongTimeout)
+			if err = l.enqueue(ctx, control("PING", u64(id))); err != nil {
+				cancel()
+				if errors.Is(err, context.DeadlineExceeded) {
+					l.fail(errors.New("shine: heartbeat timeout"))
+				}
 				return
 			}
-			timer := time.NewTimer(l.opts.PongTimeout)
 			waiting := true
 			for waiting {
 				select {
 				case <-l.done:
-					timer.Stop()
+					cancel()
 					return
 				case p := <-l.pong:
 					if p == id {
 						waiting = false
 					}
-				case <-timer.C:
+				case <-ctx.Done():
+					cancel()
 					l.fail(errors.New("shine: heartbeat timeout"))
 					return
 				}
 			}
-			timer.Stop()
+			cancel()
 		}
 	}
 }

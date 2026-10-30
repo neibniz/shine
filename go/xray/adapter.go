@@ -27,11 +27,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func options(password string, window, maxFrame, maxData, handshake, ping, pong uint32) shine.Options {
-	return shine.Options{Password: password, InitialWindow: window, MaxFrameSize: int(maxFrame), MaxDataSize: int(maxData), HandshakeTimeout: time.Duration(handshake) * time.Second, PingInterval: time.Duration(ping) * time.Second, PongTimeout: time.Duration(pong) * time.Second}
+func options(password string, window, maxFrame, maxData, handshake, ping, pong, maxSessions, datagramQueueBytes uint32) shine.Options {
+	return shine.Options{Password: password, InitialWindow: window, MaxFrameSize: int(maxFrame), MaxDataSize: int(maxData), HandshakeTimeout: time.Duration(handshake) * time.Second, PingInterval: time.Duration(ping) * time.Second, PongTimeout: time.Duration(pong) * time.Second, MaxSessions: int(maxSessions), DatagramQueueBytes: int(datagramQueueBytes)}
 }
 func (c *ServerConfig) opts() shine.Options {
-	o := options(c.Password, c.InitialWindow, c.MaxFrameSize, c.MaxDataSize, c.HandshakeTimeoutSeconds, c.PingIntervalSeconds, c.PongTimeoutSeconds)
+	o := options(c.Password, c.InitialWindow, c.MaxFrameSize, c.MaxDataSize, c.HandshakeTimeoutSeconds, c.PingIntervalSeconds, c.PongTimeoutSeconds, c.MaxSessions, c.DatagramQueueBytes)
 	for _, u := range c.Users {
 		if u == nil {
 			o.Users = append(o.Users, shine.User{})
@@ -42,7 +42,18 @@ func (c *ServerConfig) opts() shine.Options {
 	return o
 }
 func (c *ClientConfig) opts(password string) shine.Options {
-	return options(password, c.InitialWindow, c.MaxFrameSize, c.MaxDataSize, c.HandshakeTimeoutSeconds, c.PingIntervalSeconds, c.PongTimeoutSeconds)
+	return options(password, c.InitialWindow, c.MaxFrameSize, c.MaxDataSize, c.HandshakeTimeoutSeconds, c.PingIntervalSeconds, c.PongTimeoutSeconds, c.MaxSessions, c.DatagramQueueBytes)
+}
+
+const defaultMaxTotalSessions = 1024
+const defaultUDPFirstPacketTimeout = 30 * time.Second
+
+func validateResourceLimits(maxSessions, maxTotalSessions, datagramQueueBytes uint32) error {
+	// These bounds also ensure converting to int works on 32-bit targets.
+	if maxSessions > 1<<20 || maxTotalSessions > 1<<20 || datagramQueueBytes > 64<<20 {
+		return fmt.Errorf("shine: session or datagram limit is too large")
+	}
+	return nil
 }
 
 // Equals and ToProto implement Xray's protocol.Account without exposing secrets.
@@ -54,6 +65,9 @@ func (u *UserIdentity) ToProto() proto.Message { return u }
 
 // ValidateServerConfig validates credentials and protocol limits.
 func ValidateServerConfig(c *ServerConfig) error {
+	if err := validateResourceLimits(c.MaxSessions, c.MaxTotalSessions, c.DatagramQueueBytes); err != nil {
+		return err
+	}
 	if err := validateTransport(c.Transport, c.Compression); err != nil {
 		return err
 	}
@@ -66,6 +80,9 @@ func ValidateServerConfig(c *ServerConfig) error {
 // ResolveClientPassword returns the configured authentication secret.
 // A client outbound accepts exactly one user, or the legacy password field.
 func ResolveClientPassword(c *ClientConfig) (string, error) {
+	if err := validateResourceLimits(c.MaxSessions, 0, c.DatagramQueueBytes); err != nil {
+		return "", err
+	}
 	if err := validateTransport(c.Transport, c.Compression); err != nil {
 		return "", err
 	}
@@ -125,7 +142,15 @@ func init() {
 		if e := ValidateServerConfig(c); e != nil {
 			return nil, e
 		}
-		in := &Inbound{config: c}
+		maxTotal := c.MaxTotalSessions
+		if maxTotal == 0 {
+			maxTotal = defaultMaxTotalSessions
+		}
+		limiter, err := shine.NewSessionLimiter(int(maxTotal))
+		if err != nil {
+			return nil, err
+		}
+		in := &Inbound{config: c, limiter: limiter}
 		if useRedisTransport(c.Transport) {
 			var secrets []string
 			if c.Password != "" {
@@ -170,6 +195,7 @@ var _ proxy.Outbound = (*Outbound)(nil)
 type Inbound struct {
 	config  *ServerConfig
 	carrier *rediswire.Acceptor
+	limiter *shine.SessionLimiter
 }
 
 // Close releases pending and active Redis transport connections.
@@ -196,7 +222,9 @@ func (h *Inbound) Process(ctx context.Context, network xnet.Network, conn stat.C
 			return nil
 		}
 	}
-	link, err := shine.Server(ctx, stream, h.config.opts())
+	opts := h.config.opts()
+	opts.SessionLimiter = h.limiter
+	link, err := shine.Server(ctx, stream, opts)
 	if err != nil {
 		return err
 	}
@@ -266,7 +294,13 @@ func shineAddress(d xnet.Destination) (shine.Address, error) {
 }
 func (h *Inbound) dispatchSession(ctx context.Context, s *shine.Session, d routing.Dispatcher) error {
 	if s.IsUDP() {
-		first, e := s.ReceiveDatagram(ctx)
+		timeout := defaultUDPFirstPacketTimeout
+		if h.config.UdpFirstPacketTimeoutSeconds != 0 {
+			timeout = time.Duration(h.config.UdpFirstPacketTimeoutSeconds) * time.Second
+		}
+		firstCtx, cancel := context.WithTimeout(ctx, timeout)
+		first, e := s.ReceiveDatagram(firstCtx)
+		cancel()
 		if e != nil {
 			return e
 		}
