@@ -1,0 +1,28 @@
+diff --git a/infra/conf/xray.go b/infra/conf/xray.go
+index 2c94ce5..602542f 100644
+--- a/infra/conf/xray.go
++++ b/infra/conf/xray.go
+@@ -7,6 +7,7 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
++	shineconf "github.com/hhhflow2020/shine/go/xray/conf"
+ 	"github.com/xtls/xray-core/app/dispatcher"
+ 	"github.com/xtls/xray-core/app/proxyman"
+ 	"github.com/xtls/xray-core/app/stats"
+@@ -26,6 +27,7 @@ import (
+ 
+ var (
+ 	inboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
++		"shine":         func() interface{} { return new(shineconf.InboundConfig) },
+ 		"tunnel":        func() interface{} { return new(DokodemoConfig) },
+ 		"dokodemo-door": func() interface{} { return new(DokodemoConfig) },
+ 		"http":          func() interface{} { return new(HTTPServerConfig) },
+@@ -42,6 +44,7 @@ var (
+ 	}, "protocol", "settings")
+ 
+ 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
++		"shine":       func() interface{} { return new(shineconf.OutboundConfig) },
+ 		"block":       func() interface{} { return new(BlackholeConfig) },
+ 		"blackhole":   func() interface{} { return new(BlackholeConfig) },
+ 		"loopback":    func() interface{} { return new(LoopbackConfig) },

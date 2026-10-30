@@ -1,0 +1,38 @@
+syntax = "proto3";
+package shine.xray;
+option go_package = "github.com/hhhflow2020/shine/go/xray;xray";
+
+message User {
+  string auth = 1;
+  string email = 2;
+  uint32 level = 3;
+}
+
+// UserIdentity is non-secret Xray account metadata for an authenticated link.
+message UserIdentity {
+  string email = 1;
+  uint32 level = 2;
+}
+
+message ServerConfig {
+  string password = 1; // Legacy single-password configuration.
+  uint32 initial_window = 2;
+  uint32 max_frame_size = 3;
+  uint32 max_data_size = 4;
+  uint32 handshake_timeout_seconds = 5;
+  uint32 ping_interval_seconds = 6;
+  uint32 pong_timeout_seconds = 7;
+  repeated User users = 9;
+}
+message ClientConfig {
+  string address = 1;
+  uint32 port = 2;
+  string password = 3; // Legacy single-password configuration.
+  uint32 initial_window = 4;
+  uint32 max_frame_size = 5;
+  uint32 max_data_size = 6;
+  uint32 handshake_timeout_seconds = 7;
+  uint32 ping_interval_seconds = 8;
+  uint32 pong_timeout_seconds = 9;
+  repeated User users = 11;
+}
